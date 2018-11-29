@@ -107,6 +107,17 @@ func (s *KVStore) CasInternal(k string, v string, vn string) pb.Result {
 	}
 }
 
+// Used internally to dump out all the values
+// Could be used as creating snapshot or shard migration
+func (s *KVStore) DumpInternal() []*pb.KeyValue {
+	log.Printf("Dump out all the values from KV store")
+	kvdump := make([]*pb.KeyValue, 0)
+	for k, v := range s.store {
+		kvdump = append(kvdump, &pb.KeyValue{Key: k, Value: v})
+	}
+	return kvdump
+}
+
 func (s *KVStore) HandleCommand(op InputChannelType) {
 	switch c := op.command; c.Operation {
 	case pb.Op_GET:

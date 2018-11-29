@@ -26,11 +26,39 @@ type VoteInput struct {
 	response chan pb.RequestVoteRet
 }
 
+type InstallSnapshotInput struct {
+	arg      *pb.InstallSnapshotArgs
+	response chan pb.InstallSnapshotRet
+}
+
+type AppendResponse struct {
+	ret  *pb.AppendEntriesRet
+	arg  *pb.AppendEntriesArgs
+	err  error
+	peer string
+}
+
+type VoteResponse struct {
+	ret  *pb.RequestVoteRet
+	arg  *pb.RequestVoteArgs
+	err  error
+	peer string
+}
+
+type InstallShapshotResponse struct {
+	ret  *pb.InstallSnapshotRet
+	arg  *pb.InstallSnapshotArgs
+	err  error
+	peer string
+}
+
 // Struct off of which we shall hang the Raft service
 type Raft struct {
+	id string
 	// ---------------------- helper variables --------------------------------------------
-	AppendChan chan AppendEntriesInput
-	VoteChan   chan VoteInput
+	AppendChan          chan AppendEntriesInput
+	VoteChan            chan VoteInput
+	InstallSnapshotChan chan InstallSnapshotInput
 
 	state      int // 0:follower 1:candidate 2:leader
 	voteCount  int // count of votes we have got
@@ -39,15 +67,24 @@ type Raft struct {
 
 	// ---------------------- non-volatile on each server ---------------------------------
 	// but - in our homeworks we don't really have a stable storage
-	currentTerm  int64
-	votedFor     string
-	log          []*pb.Entry
-	lastLogIndex int64
-	lastLogTerm  int64
+	currentTerm   int64
+	votedFor      string
+	log           []*pb.Entry
+	firstLogIndex int64
+	lastLogIndex  int64
+	lastLogTerm   int64
 
 	// ---------------------- valatile on each server -------------------------------------
 	commitIndex int64
 	lastApplied int64
+
+	// snapshot related
+	snapshotData      []*pb.KeyValue
+	lastIncludedIndex int64
+	lastIncludedTerm  int64
+
+	// each time we reach this limit, we will compact current COMMIT POINT state into the snapshot
+	maxCommitLog int64
 
 	// ----------------------- volatile on the leaders ------------------------------------
 	// Should be re-initilize after election
@@ -93,10 +130,17 @@ func (r *Raft) RequestVote(ctx context.Context, arg *pb.RequestVoteArgs) (*pb.Re
 	return &result, nil
 }
 
+func (r *Raft) InstallSnapshot(ctx context.Context, arg *pb.InstallSnapshotArgs) (*pb.InstallSnapshotRet, error) {
+	c := make(chan pb.InstallSnapshotRet)
+	r.InstallSnapshotChan <- InstallSnapshotInput{arg: arg, response: c}
+	result := <-c
+	return &result, nil
+}
+
 // Compute a random duration in milliseconds
 func randomDuration(r *rand.Rand) time.Duration {
-	const DurationMax = 10000
-	const DurationMin = 2500
+	const DurationMax = 20000
+	const DurationMin = 5000
 	return time.Duration(r.Intn(DurationMax-DurationMin)+DurationMin) * time.Millisecond
 }
 
@@ -110,11 +154,10 @@ func restartTimer(timer *time.Timer, r *rand.Rand, isHeartbeat bool) {
 		for len(timer.C) > 0 {
 			<-timer.C
 		}
-
 	}
 
 	if isHeartbeat {
-		timer.Reset(250 * time.Millisecond)
+		timer.Reset(1000 * time.Millisecond)
 	} else {
 		timer.Reset(randomDuration(r))
 	}
@@ -154,22 +197,71 @@ func connectToPeer(peer string) (pb.RaftClient, error) {
 	return pb.NewRaftClient(conn), nil
 }
 
+func createSnapShot(r *Raft, s *KVStore) {
+	// pull out all data, we don't have a disk, thus we just store them in memory
+	r.snapshotData = s.DumpInternal()
+	r.lastIncludedIndex = r.lastApplied
+	r.lastIncludedTerm = r.log[r.lastApplied-r.firstLogIndex].Term
+
+	// now, we discard all the executed logs so far.
+	// WARNING: CARFULLY CHECK THE INDEX(-1, +1) HERE
+	r.log = r.log[(r.lastApplied - r.firstLogIndex + 1):]
+	r.firstLogIndex = r.lastApplied + 1
+}
+
+func broadcastHeatbeat(raft *Raft, peerClients *map[string]pb.RaftClient, appendResponseChan *chan AppendResponse) {
+	for p, c := range *peerClients {
+		prevLogIndex := raft.nextIndex[p] - 1
+		var prevLogTerm int64 = -1
+		if prevLogIndex >= 0 {
+			prevLogTerm = raft.log[prevLogIndex].Term
+		}
+		args := pb.AppendEntriesArgs{
+			Term:         raft.currentTerm,
+			LeaderID:     raft.id,
+			PrevLogIndex: prevLogIndex,
+			PrevLogTerm:  prevLogTerm,
+			Entries:      make([]*pb.Entry, 0),
+			LeaderCommit: raft.commitIndex,
+		}
+		go func(c pb.RaftClient,
+			p string,
+			args *pb.AppendEntriesArgs) {
+			ret, err := c.AppendEntries(context.Background(), args)
+			*appendResponseChan <- AppendResponse{ret: ret, arg: args, err: err, peer: p}
+		}(c, p, &args)
+	}
+}
+
 // The main service loop. All modifications to the KV store are run through here.
 func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int) {
 	raft := Raft{
-		AppendChan:    make(chan AppendEntriesInput),
-		VoteChan:      make(chan VoteInput),
-		state:         0,
-		voteCount:     0,
-		numPeers:      len(*peers),
-		majorCount:    len(*peers)/2 + 1,
+		id: id,
+
+		AppendChan:          make(chan AppendEntriesInput),
+		VoteChan:            make(chan VoteInput),
+		InstallSnapshotChan: make(chan InstallSnapshotInput),
+
+		state:      0,
+		voteCount:  0,
+		numPeers:   len(*peers),
+		majorCount: len(*peers)/2 + 1,
+
 		currentTerm:   -1,
 		votedFor:      "",
 		log:           make([]*pb.Entry, 0),
+		firstLogIndex: 0,
 		lastLogIndex:  -1,
 		lastLogTerm:   -1,
-		commitIndex:   -1,
-		lastApplied:   -1,
+
+		commitIndex: -1,
+		lastApplied: -1,
+
+		snapshotData:      make([]*pb.KeyValue, 0),
+		lastIncludedIndex: -1,
+		lastIncludedTerm:  -1,
+		maxCommitLog:      5, // temporally we set a quite small value to see the effect :)
+
 		nextIndex:     nil,
 		matchIndex:    nil,
 		responseChans: nil, // only a leader needs to response to clients
@@ -189,21 +281,9 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int) {
 		log.Printf("Connected to %v", peer)
 	}
 
-	type AppendResponse struct {
-		ret  *pb.AppendEntriesRet
-		arg  *pb.AppendEntriesArgs
-		err  error
-		peer string
-	}
-
-	type VoteResponse struct {
-		ret  *pb.RequestVoteRet
-		arg  *pb.RequestVoteArgs
-		err  error
-		peer string
-	}
 	appendResponseChan := make(chan AppendResponse)
 	voteResponseChan := make(chan VoteResponse)
+	//installSnapshotResponseChan := make(chan InstallShapshotResponse)
 
 	// Create a timer and start running it
 	timer := time.NewTimer(randomDuration(r))
@@ -241,28 +321,7 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int) {
 				restartTimer(timer, r, false)
 			} else {
 				log.Printf("Leader trigger a new round of heatbeat messages with term %v", raft.currentTerm)
-
-				for p, c := range peerClients {
-					prevLogIndex := raft.nextIndex[p] - 1
-					var prevLogTerm int64 = -1
-					if prevLogIndex >= 0 {
-						prevLogTerm = raft.log[prevLogIndex].Term
-					}
-					args := pb.AppendEntriesArgs{
-						Term:         raft.currentTerm,
-						LeaderID:     id,
-						PrevLogIndex: prevLogIndex,
-						PrevLogTerm:  prevLogTerm,
-						Entries:      make([]*pb.Entry, 0),
-						LeaderCommit: raft.commitIndex,
-					}
-					go func(c pb.RaftClient,
-						p string,
-						args *pb.AppendEntriesArgs) {
-						ret, err := c.AppendEntries(context.Background(), args)
-						appendResponseChan <- AppendResponse{ret: ret, arg: args, err: err, peer: p}
-					}(c, p, &args)
-				}
+				broadcastHeatbeat(&raft, &peerClients, &appendResponseChan)
 
 				// This would be a heartbeat timer
 				restartTimer(timer, r, true)
@@ -467,28 +526,7 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int) {
 
 						// now, send out the initial heartbeat message!
 						log.Printf("Leader trigger a new round of heartbeat messages on term %v", raft.currentTerm)
-
-						for p, c := range peerClients {
-							prevLogIndex := raft.nextIndex[p] - 1
-							var prevLogTerm int64 = -1
-							if prevLogIndex >= 0 {
-								prevLogTerm = raft.log[prevLogIndex].Term
-							}
-							args := pb.AppendEntriesArgs{
-								Term:         raft.currentTerm,
-								LeaderID:     id,
-								PrevLogIndex: prevLogIndex,
-								PrevLogTerm:  prevLogTerm,
-								Entries:      make([]*pb.Entry, 0),
-								LeaderCommit: raft.commitIndex,
-							}
-							go func(c pb.RaftClient,
-								p string,
-								args *pb.AppendEntriesArgs) {
-								ret, err := c.AppendEntries(context.Background(), args)
-								appendResponseChan <- AppendResponse{ret: ret, arg: args, err: err, peer: p}
-							}(c, p, &args)
-						}
+						broadcastHeatbeat(&raft, &peerClients, &appendResponseChan)
 
 						// This would be a heartbeat timer
 						restartTimer(timer, r, true)
@@ -627,4 +665,5 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int) {
 		}
 	}
 	log.Printf("Strange to arrive here")
+	createSnapShot(&raft, s)
 }

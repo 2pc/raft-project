@@ -116,8 +116,22 @@ message RequestVoteRet {
     bool voteGranted = 2;
 }
 
+// Input to InstallSnaption (as defined in Figure 13)
+message InstallSnapshotArgs {
+    int64 term = 1;
+    string leaderID = 2;
+    int64 lastIncludedIndex = 3;
+    int64 lastIncludedTerm = 4;
+    repeated KeyValue data = 5;
+}
+
+message InstallSnapshotRet {
+    int64 term = 1;
+}
+
 // Raft service
 service Raft {
     rpc AppendEntries(AppendEntriesArgs) returns (AppendEntriesRet) {}
     rpc RequestVote(RequestVoteArgs) returns (RequestVoteRet) {}
+    rpc InstallSnapshot(InstallSnapshotArgs) returns (InstallSnapshotRet) {}
 }
