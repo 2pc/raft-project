@@ -118,6 +118,16 @@ func (s *KVStore) DumpInternal() []*pb.KeyValue {
 	return kvdump
 }
 
+// Used internall to restore from a snapshot
+// WARNING: this will force clean the store
+func (s *KVStore) RestoreSnapshot(kvdump []*pb.KeyValue) {
+	log.Printf("Restore all value from a snapshot")
+	s.store = make(map[string]string)
+	for _, kv := range kvdump {
+		s.store[kv.Key] = s.store[kv.Value]
+	}
+}
+
 func (s *KVStore) HandleCommand(op InputChannelType) {
 	switch c := op.command; c.Operation {
 	case pb.Op_GET:

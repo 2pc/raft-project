@@ -207,14 +207,43 @@ func createSnapShot(r *Raft, s *KVStore) {
 	// WARNING: CARFULLY CHECK THE INDEX(-1, +1) HERE
 	r.log = r.log[(r.lastApplied - r.firstLogIndex + 1):]
 	r.firstLogIndex = r.lastApplied + 1
+
+	log.Printf("Snapshot created, last index:%v, last term:%v", r.lastIncludedIndex, r.lastIncludedTerm)
 }
 
-func broadcastHeatbeat(raft *Raft, peerClients *map[string]pb.RaftClient, appendResponseChan *chan AppendResponse) {
+func sendSnapShot(raft *Raft, p string, c pb.RaftClient, installSnapshotResponseChan *chan InstallShapshotResponse) {
+	log.Printf("Sending peer %v snap shot, last index:%v, last term:%v", p, raft.lastIncludedIndex, raft.lastIncludedTerm)
+	// send my snapshot to the peer
+	args := pb.InstallSnapshotArgs{
+		Term:              raft.currentTerm,
+		LeaderID:          raft.id,
+		LastIncludedIndex: raft.lastIncludedIndex,
+		LastIncludedTerm:  raft.lastIncludedTerm,
+		Data:              raft.snapshotData,
+	}
+	go func(c pb.RaftClient,
+		p string,
+		args *pb.InstallSnapshotArgs) {
+		ret, err := c.InstallSnapshot(context.Background(), args)
+		*installSnapshotResponseChan <- InstallShapshotResponse{ret: ret, arg: args, err: err, peer: p}
+	}(c, p, &args)
+}
+
+func broadcastHeartbeat(raft *Raft, peerClients *map[string]pb.RaftClient,
+	appendResponseChan *chan AppendResponse, installSnapshotResponseChan *chan InstallShapshotResponse) {
 	for p, c := range *peerClients {
 		prevLogIndex := raft.nextIndex[p] - 1
+
+		// This means instead of a heartbeat, we need to install a snapshot
+		if prevLogIndex < raft.lastIncludedIndex {
+			sendSnapShot(raft, p, c, installSnapshotResponseChan)
+			continue
+		}
 		var prevLogTerm int64 = -1
-		if prevLogIndex >= 0 {
-			prevLogTerm = raft.log[prevLogIndex].Term
+		if prevLogIndex == raft.lastIncludedIndex {
+			prevLogTerm = raft.lastIncludedTerm
+		} else {
+			prevLogTerm = raft.log[prevLogIndex-raft.firstLogIndex].Term
 		}
 		args := pb.AppendEntriesArgs{
 			Term:         raft.currentTerm,
@@ -245,7 +274,7 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int) {
 		state:      0,
 		voteCount:  0,
 		numPeers:   len(*peers),
-		majorCount: len(*peers)/2 + 1,
+		majorCount: (len(*peers)+1)/2 + 1,
 
 		currentTerm:   -1,
 		votedFor:      "",
@@ -283,7 +312,7 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int) {
 
 	appendResponseChan := make(chan AppendResponse)
 	voteResponseChan := make(chan VoteResponse)
-	//installSnapshotResponseChan := make(chan InstallShapshotResponse)
+	installSnapshotResponseChan := make(chan InstallShapshotResponse)
 
 	// Create a timer and start running it
 	timer := time.NewTimer(randomDuration(r))
@@ -321,7 +350,7 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int) {
 				restartTimer(timer, r, false)
 			} else {
 				log.Printf("Leader trigger a new round of heatbeat messages with term %v", raft.currentTerm)
-				broadcastHeatbeat(&raft, &peerClients, &appendResponseChan)
+				broadcastHeartbeat(&raft, &peerClients, &appendResponseChan, &installSnapshotResponseChan)
 
 				// This would be a heartbeat timer
 				restartTimer(timer, r, true)
@@ -384,8 +413,8 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int) {
 				raft.votedFor = ae.arg.LeaderID
 			}
 
-			if (ae.arg.PrevLogIndex != -1) &&
-				((ae.arg.PrevLogIndex > raft.lastLogIndex) || (ae.arg.PrevLogTerm != raft.log[ae.arg.PrevLogIndex].Term)) {
+			if (ae.arg.PrevLogIndex > raft.lastLogIndex) ||
+				((ae.arg.PrevLogIndex >= raft.firstLogIndex) && (ae.arg.PrevLogTerm != raft.log[ae.arg.PrevLogIndex-raft.firstLogIndex].Term)) {
 				log.Printf("Reject append entry from %v, due to prevLogIndex too large or prevLogTerm mismatch", ae.arg.LeaderID)
 				ae.response <- pb.AppendEntriesRet{Term: raft.currentTerm, Success: false}
 				break
@@ -395,22 +424,28 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int) {
 			for id, val := range ae.arg.Entries {
 				appendingId := startIndex + int64(id)
 				log.Printf("Try to append log entry index id: %v", appendingId)
+
+				// we don't need to care about already committed entries
+				if appendingId <= raft.commitIndex {
+					continue
+				}
+
 				if appendingId > raft.lastLogIndex {
 					raft.log = append(raft.log, val)
 					raft.lastLogIndex = appendingId
 				} else {
-					if raft.log[appendingId].Term != val.Term {
+					if raft.log[appendingId-raft.firstLogIndex].Term != val.Term {
 						// term mismatch, delete all entries that follows it
 						log.Printf("Term mismatch, delete all entries starting from %v", appendingId)
-						raft.log = raft.log[0:appendingId]
+						raft.log = raft.log[0:(appendingId - raft.firstLogIndex)]
 						raft.log = append(raft.log, val)
 						raft.lastLogIndex = appendingId
 					}
 				}
 			}
 
-			if raft.lastLogIndex >= 0 {
-				raft.lastLogTerm = raft.log[raft.lastLogIndex].Term
+			if raft.lastLogIndex >= raft.firstLogIndex {
+				raft.lastLogTerm = raft.log[raft.lastLogIndex-raft.firstLogIndex].Term
 			}
 			raft.commitIndex = max(raft.commitIndex, min(ae.arg.LeaderCommit, raft.lastLogIndex))
 
@@ -419,7 +454,7 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int) {
 				log.Printf("Try to execute log entry index id: %v", nextApply)
 				c := make(chan pb.Result)
 				arg := InputChannelType{
-					command:  *raft.log[nextApply].Cmd,
+					command:  *raft.log[nextApply-raft.firstLogIndex].Cmd,
 					response: c,
 				}
 				go func(parg *InputChannelType) {
@@ -427,6 +462,11 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int) {
 				}(&arg)
 				<-c
 				raft.lastApplied = nextApply
+			}
+
+			// if we have enough executed commands, we create a snapshot
+			if raft.lastApplied-raft.firstLogIndex+1 > raft.maxCommitLog {
+				createSnapShot(&raft, s)
 			}
 
 			ae.response <- pb.AppendEntriesRet{Term: raft.currentTerm, Success: true}
@@ -526,7 +566,7 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int) {
 
 						// now, send out the initial heartbeat message!
 						log.Printf("Leader trigger a new round of heartbeat messages on term %v", raft.currentTerm)
-						broadcastHeatbeat(&raft, &peerClients, &appendResponseChan)
+						broadcastHeartbeat(&raft, &peerClients, &appendResponseChan, &installSnapshotResponseChan)
 
 						// This would be a heartbeat timer
 						restartTimer(timer, r, true)
@@ -566,6 +606,7 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int) {
 				// 1. update the information of this peer
 				raft.matchIndex[ar.peer] = ar.arg.PrevLogIndex + int64(len(ar.arg.Entries))
 				raft.nextIndex[ar.peer] = raft.matchIndex[ar.peer] + 1
+
 				// 2. check if we could commit any logs
 				for nextCommit := raft.commitIndex + 1; nextCommit <= raft.lastLogIndex; nextCommit++ {
 					// check if we could commit "commitIndex + 1"
@@ -576,7 +617,7 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int) {
 						}
 					}
 					if count >= raft.majorCount {
-						log.Printf("Commit log index: %v term: %v", nextCommit, raft.log[nextCommit].Term)
+						log.Printf("Commit log index: %v term: %v", nextCommit, raft.log[nextCommit-raft.firstLogIndex].Term)
 						raft.commitIndex = nextCommit
 					} else {
 						break
@@ -588,7 +629,7 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int) {
 					if responseChan, ok := raft.responseChans[nextApply]; ok {
 						log.Printf("Try to execute & response log entry index id: %v", nextApply)
 						s.HandleCommand(InputChannelType{
-							command:  *raft.log[nextApply].Cmd,
+							command:  *raft.log[nextApply-raft.firstLogIndex].Cmd,
 							response: *responseChan,
 						})
 					} else {
@@ -598,7 +639,7 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int) {
 						log.Printf("Try to execute log entry index id: %v", nextApply)
 						c := make(chan pb.Result)
 						arg := InputChannelType{
-							command:  *raft.log[nextApply].Cmd,
+							command:  *raft.log[nextApply-raft.firstLogIndex].Cmd,
 							response: c,
 						}
 						go func(parg *InputChannelType) {
@@ -608,29 +649,44 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int) {
 					}
 					raft.lastApplied = nextApply
 				}
-				// 3. send new appendEntry requests, if we have more logs
+
+				// 4. if we have enough executed commands, we create a snapshot
+				if raft.lastApplied-raft.firstLogIndex+1 > raft.maxCommitLog {
+					createSnapShot(&raft, s)
+				}
+
+				// 5. send new appendEntry requests, if we have more logs
 				if raft.lastLogIndex >= raft.nextIndex[ar.peer] {
 					// Seems that we still need to check "-1" stuff..
 					prevLogIndex := raft.nextIndex[ar.peer] - 1
-					var prevLogTerm int64 = -1
-					if prevLogIndex >= 0 {
-						prevLogTerm = raft.log[prevLogIndex].Term
+
+					if prevLogIndex < raft.lastIncludedIndex {
+						// This means we need to install a snapshot
+						sendSnapShot(&raft, ar.peer, peerClients[ar.peer], &installSnapshotResponseChan)
+					} else {
+						var prevLogTerm int64 = -1
+						if prevLogIndex == raft.lastIncludedIndex {
+							prevLogTerm = raft.lastIncludedTerm
+						} else {
+							prevLogTerm = raft.log[prevLogIndex-raft.firstLogIndex].Term
+						}
+
+						log.Printf("Send peer %v the logs in range [%v, %v]", ar.peer, raft.nextIndex[ar.peer], raft.lastLogIndex)
+						args := pb.AppendEntriesArgs{
+							Term:         raft.currentTerm,
+							LeaderID:     id,
+							PrevLogIndex: prevLogIndex,
+							PrevLogTerm:  prevLogTerm,
+							Entries:      raft.log[(raft.nextIndex[ar.peer] - raft.firstLogIndex):(raft.lastLogIndex - raft.firstLogIndex + 1)],
+							LeaderCommit: raft.commitIndex,
+						}
+						go func(c pb.RaftClient,
+							p string,
+							args *pb.AppendEntriesArgs) {
+							ret, err := c.AppendEntries(context.Background(), args)
+							appendResponseChan <- AppendResponse{ret: ret, arg: args, err: err, peer: p}
+						}(peerClients[ar.peer], ar.peer, &args)
 					}
-					log.Printf("Send peer %v the logs in range [%v, %v]", ar.peer, raft.nextIndex[ar.peer], raft.lastLogIndex)
-					args := pb.AppendEntriesArgs{
-						Term:         raft.currentTerm,
-						LeaderID:     id,
-						PrevLogIndex: prevLogIndex,
-						PrevLogTerm:  prevLogTerm,
-						Entries:      raft.log[raft.nextIndex[ar.peer]:(raft.lastLogIndex + 1)],
-						LeaderCommit: raft.commitIndex,
-					}
-					go func(c pb.RaftClient,
-						p string,
-						args *pb.AppendEntriesArgs) {
-						ret, err := c.AppendEntries(context.Background(), args)
-						appendResponseChan <- AppendResponse{ret: ret, arg: args, err: err, peer: p}
-					}(peerClients[ar.peer], ar.peer, &args)
 				}
 			} else {
 				// this means the peer's logs are lack behind, we need to reduce raft.nextIndex[] and retry
@@ -639,31 +695,101 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int) {
 
 				// 2. retry!
 				if raft.lastLogIndex >= raft.nextIndex[ar.peer] {
-					// Seems that we still need to check "-1" stuff..
 					prevLogIndex := raft.nextIndex[ar.peer] - 1
-					var prevLogTerm int64 = -1
-					if prevLogIndex >= 0 {
-						prevLogTerm = raft.log[prevLogIndex].Term
+					if prevLogIndex < raft.lastIncludedIndex {
+						// This means we need to install a snapshot
+						sendSnapShot(&raft, ar.peer, peerClients[ar.peer], &installSnapshotResponseChan)
+					} else {
+						var prevLogTerm int64 = -1
+						if prevLogIndex == raft.lastIncludedIndex {
+							prevLogTerm = raft.lastIncludedTerm
+						} else {
+							prevLogTerm = raft.log[prevLogIndex-raft.firstLogIndex].Term
+						}
+						log.Printf("Send peer %v the logs in range [%v, %v]", ar.peer, raft.nextIndex[ar.peer], raft.lastLogIndex)
+						args := pb.AppendEntriesArgs{
+							Term:         raft.currentTerm,
+							LeaderID:     id,
+							PrevLogIndex: prevLogIndex,
+							PrevLogTerm:  prevLogTerm,
+							Entries:      raft.log[raft.nextIndex[ar.peer]-raft.firstLogIndex : (raft.lastLogIndex - raft.firstLogIndex + 1)],
+							LeaderCommit: raft.commitIndex,
+						}
+						go func(c pb.RaftClient,
+							p string,
+							args *pb.AppendEntriesArgs) {
+							ret, err := c.AppendEntries(context.Background(), args)
+							appendResponseChan <- AppendResponse{ret: ret, arg: args, err: err, peer: p}
+						}(peerClients[ar.peer], ar.peer, &args)
 					}
-					log.Printf("Send peer %v the logs in range [%v, %v]", ar.peer, raft.nextIndex[ar.peer], raft.lastLogIndex)
-					args := pb.AppendEntriesArgs{
-						Term:         raft.currentTerm,
-						LeaderID:     id,
-						PrevLogIndex: prevLogIndex,
-						PrevLogTerm:  prevLogTerm,
-						Entries:      raft.log[raft.nextIndex[ar.peer]:(raft.lastLogIndex + 1)],
-						LeaderCommit: raft.commitIndex,
-					}
-					go func(c pb.RaftClient,
-						p string,
-						args *pb.AppendEntriesArgs) {
-						ret, err := c.AppendEntries(context.Background(), args)
-						appendResponseChan <- AppendResponse{ret: ret, arg: args, err: err, peer: p}
-					}(peerClients[ar.peer], ar.peer, &args)
 				}
 			}
+		case is := <-raft.InstallSnapshotChan:
+			log.Printf("Received install snapshot from %v, term %v", is.arg.LeaderID, is.arg.Term)
+
+			if is.arg.Term < raft.currentTerm {
+				log.Printf("Reject snapshot from %v, due to arg.Term %v smaller than term %v",
+					is.arg.LeaderID, is.arg.Term, raft.currentTerm)
+				is.response <- pb.InstallSnapshotRet{Term: raft.currentTerm}
+				break
+			}
+
+			if is.arg.Term >= raft.currentTerm {
+				// Transit to follower
+				raft.state = 0
+				raft.voteCount = 0
+				raft.currentTerm = is.arg.Term
+				raft.votedFor = is.arg.LeaderID
+			}
+
+			if is.arg.LastIncludedIndex <= raft.lastApplied {
+				log.Printf("Ignore snapshot from %v, due to already executed", is.arg.LeaderID)
+				is.response <- pb.InstallSnapshotRet{Term: raft.currentTerm}
+				break
+			}
+
+			log.Printf("Reset server state using the snapshot")
+			s.RestoreSnapshot(is.arg.Data)
+			raft.log = make([]*pb.Entry, 0)
+			raft.firstLogIndex = is.arg.LastIncludedIndex + 1
+			raft.lastLogIndex = is.arg.LastIncludedIndex
+			raft.lastLogTerm = is.arg.LastIncludedTerm
+			raft.commitIndex = is.arg.LastIncludedIndex
+			raft.lastApplied = is.arg.LastIncludedIndex
+			raft.snapshotData = is.arg.Data
+			raft.lastIncludedIndex = is.arg.LastIncludedIndex
+			raft.lastIncludedTerm = is.arg.LastIncludedTerm
+
+			is.response <- pb.InstallSnapshotRet{Term: raft.currentTerm}
+
+			// restart timer
+			restartTimer(timer, r, false)
+
+		case sr := <-installSnapshotResponseChan:
+			if sr.err != nil {
+				log.Printf("Error calling RPC %v", sr.err)
+				break
+			}
+
+			if sr.ret.Term > raft.currentTerm {
+				// reset as a follower
+				log.Printf("Term %v greater than currect term %v, reset as a follower", sr.ret.Term, raft.currentTerm)
+				raft.currentTerm = sr.ret.Term
+				raft.votedFor = ""
+				raft.voteCount = 0
+				raft.state = 0
+				restartTimer(timer, r, false)
+			}
+
+			if sr.arg.Term < raft.currentTerm {
+				log.Printf("Ignore an out-dated InstallSnapshot response")
+				break
+			}
+
+			// update the information for this peer
+			raft.matchIndex[sr.peer] = sr.arg.LastIncludedIndex
+			raft.nextIndex[sr.peer] = raft.matchIndex[sr.peer] + 1
 		}
 	}
 	log.Printf("Strange to arrive here")
-	createSnapShot(&raft, s)
 }
