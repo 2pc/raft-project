@@ -65,6 +65,8 @@ type Raft struct {
 	numPeers   int // total number of peers in the system
 	majorCount int // = numPeers/2 + 1
 
+	peerLive map[string]bool
+
 	// ---------------------- non-volatile on each server ---------------------------------
 	// but - in our homeworks we don't really have a stable storage
 	currentTerm   int64
@@ -232,6 +234,9 @@ func sendSnapShot(raft *Raft, p string, c pb.RaftClient, installSnapshotResponse
 func broadcastHeartbeat(raft *Raft, peerClients *map[string]pb.RaftClient,
 	appendResponseChan *chan AppendResponse, installSnapshotResponseChan *chan InstallShapshotResponse) {
 	for p, c := range *peerClients {
+		if !raft.peerLive[p] {
+			continue
+		}
 		prevLogIndex := raft.nextIndex[p] - 1
 
 		// This means instead of a heartbeat, we need to install a snapshot
@@ -276,6 +281,8 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int) {
 		numPeers:   len(*peers),
 		majorCount: (len(*peers)+1)/2 + 1,
 
+		peerLive: make(map[string]bool),
+
 		currentTerm:   -1,
 		votedFor:      "",
 		log:           make([]*pb.Entry, 0),
@@ -307,6 +314,7 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int) {
 		}
 
 		peerClients[peer] = client
+		raft.peerLive[peer] = true
 		log.Printf("Connected to %v", peer)
 	}
 
@@ -334,6 +342,9 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int) {
 				raft.currentTerm += 1
 
 				for p, c := range peerClients {
+					if !raft.peerLive[p] {
+						continue
+					}
 					// Send in parallel so we don't wait for each client.
 					args := pb.RequestVoteArgs{
 						Term:         raft.currentTerm,
@@ -355,6 +366,7 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int) {
 				// This would be a heartbeat timer
 				restartTimer(timer, r, true)
 			}
+
 		case op := <-s.C:
 			if raft.state == 0 {
 				// as a follower, we should response with redirect message
@@ -397,6 +409,11 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int) {
 		case ae := <-raft.AppendChan:
 			// We received an AppendEntries request from a Raft peer
 			log.Printf("Received append entry from %v, term %v", ae.arg.LeaderID, ae.arg.Term)
+
+			if !raft.peerLive[ae.arg.LeaderID] {
+				log.Printf("%v not in current view, ignore", ae.arg.LeaderID)
+				break
+			}
 
 			if ae.arg.Term < raft.currentTerm {
 				log.Printf("Reject append entry from %v, due to arg.Term %v smaller than term %v",
@@ -451,10 +468,33 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int) {
 
 			// run the commands in our local kvstore
 			for nextApply := raft.lastApplied + 1; nextApply <= raft.commitIndex; nextApply++ {
+				nextLog := raft.log[nextApply-raft.firstLogIndex].Cmd
+				if nextLog.Operation == pb.Op_PeerJoin {
+					// a node join
+					joinpeer := nextLog.GetPeerJoinLeave().Peer
+					if !raft.peerLive[joinpeer] {
+						raft.numPeers += 1
+						raft.majorCount = (raft.numPeers+1)/2 + 1
+						raft.peerLive[joinpeer] = true
+					}
+					continue
+				} else if nextLog.Operation == pb.Op_PeerLeave {
+					// a node leave
+					leavepeer := nextLog.GetPeerJoinLeave().Peer
+					if leavepeer == raft.id {
+						// I should leave....shut down
+						log.Fatalf("I'm forcing to leave the cluster, bye")
+					} else if raft.peerLive[leavepeer] {
+						raft.numPeers -= 1
+						raft.majorCount = (raft.numPeers+1)/2 + 1
+						raft.peerLive[leavepeer] = false
+					}
+					continue
+				}
 				log.Printf("Try to execute log entry index id: %v", nextApply)
 				c := make(chan pb.Result)
 				arg := InputChannelType{
-					command:  *raft.log[nextApply-raft.firstLogIndex].Cmd,
+					command:  *nextLog,
 					response: c,
 				}
 				go func(parg *InputChannelType) {
@@ -476,6 +516,11 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int) {
 		case vr := <-raft.VoteChan:
 			// We received a RequestVote RPC from a raft peer
 			log.Printf("Received vote request from %v, term %v", vr.arg.CandidateID, vr.arg.Term)
+
+			if !raft.peerLive[vr.arg.CandidateID] {
+				log.Printf("%v not in current view, ignore", vr.arg.CandidateID)
+				break
+			}
 
 			// update the term we have seen
 			if vr.arg.Term > raft.currentTerm {
@@ -524,6 +569,11 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int) {
 				// Do not do Fatalf here since the peer might be gone but we should survive.
 				log.Printf("Error calling RPC %v", vr.err)
 			} else {
+				if !raft.peerLive[vr.peer] {
+					log.Printf("%v not in current view, ignore", vr.peer)
+					break
+				}
+
 				log.Printf("Got response to vote request from %v", vr.peer)
 				log.Printf("Peers %s granted %v term %v", vr.peer, vr.ret.VoteGranted, vr.ret.Term)
 
@@ -579,6 +629,11 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int) {
 				log.Printf("Error calling RPC %v", ar.err)
 				break
 			}
+
+			if !raft.peerLive[ar.peer] {
+				log.Printf("%v not in current view, ignore", ar.peer)
+				break
+			}
 			// We received a response to a previous AppendEntries RPC call
 			log.Printf("Got append entries response from %v, result %v", ar.peer, ar.ret.Success)
 
@@ -603,6 +658,7 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int) {
 			}
 
 			if ar.ret.Success {
+
 				// 1. update the information of this peer
 				raft.matchIndex[ar.peer] = ar.arg.PrevLogIndex + int64(len(ar.arg.Entries))
 				raft.nextIndex[ar.peer] = raft.matchIndex[ar.peer] + 1
@@ -610,17 +666,59 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int) {
 				// 2. check if we could commit any logs
 				for nextCommit := raft.commitIndex + 1; nextCommit <= raft.lastLogIndex; nextCommit++ {
 					// check if we could commit "commitIndex + 1"
-					count := 1 // we really have "replicated" the log to ourselves
-					for p, _ := range peerClients {
-						if raft.matchIndex[p] >= nextCommit {
-							count += 1
+					nextLog := raft.log[nextCommit-raft.firstLogIndex].Cmd
+					if nextLog.Operation == pb.Op_PeerJoin {
+						// a node join
+						count := 1
+						for p, _ := range peerClients {
+							if raft.peerLive[p] && raft.matchIndex[p] >= nextCommit {
+								count += 1
+							}
 						}
-					}
-					if count >= raft.majorCount {
-						log.Printf("Commit log index: %v term: %v", nextCommit, raft.log[nextCommit-raft.firstLogIndex].Term)
-						raft.commitIndex = nextCommit
+						if count >= (raft.numPeers+2)/2+1 {
+							joinpeer := nextLog.GetPeerJoinLeave().Peer
+							if !raft.peerLive[joinpeer] {
+								raft.numPeers += 1
+								raft.majorCount = (raft.numPeers+1)/2 + 1
+								raft.peerLive[joinpeer] = true
+							}
+						} else {
+							break
+						}
+					} else if nextLog.Operation == pb.Op_PeerLeave {
+						// a node leave
+						count := 1
+						for p, _ := range peerClients {
+							if raft.peerLive[p] && raft.matchIndex[p] >= nextCommit {
+								count += 1
+							}
+						}
+						if count >= (raft.numPeers+2)/2+1 {
+							leavepeer := nextLog.GetPeerJoinLeave().Peer
+							if leavepeer == raft.id {
+								// I should leave....shut down
+								log.Fatalf("I'm forcing to leave the cluster, bye")
+							} else if raft.peerLive[leavepeer] {
+								raft.numPeers -= 1
+								raft.majorCount = (raft.numPeers+1)/2 + 1
+								raft.peerLive[leavepeer] = false
+							}
+						} else {
+							break
+						}
 					} else {
-						break
+						count := 1 // we really have "replicated" the log to ourselves
+						for p, _ := range peerClients {
+							if raft.peerLive[p] && raft.matchIndex[p] >= nextCommit {
+								count += 1
+							}
+						}
+						if count >= raft.majorCount {
+							log.Printf("Commit log index: %v term: %v", nextCommit, raft.log[nextCommit-raft.firstLogIndex].Term)
+							raft.commitIndex = nextCommit
+						} else {
+							break
+						}
 					}
 				}
 
@@ -725,6 +823,10 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int) {
 				}
 			}
 		case is := <-raft.InstallSnapshotChan:
+			if !raft.peerLive[is.arg.LeaderID] {
+				log.Printf("%v not in current view, ignore", is.arg.LeaderID)
+				break
+			}
 			log.Printf("Received install snapshot from %v, term %v", is.arg.LeaderID, is.arg.Term)
 
 			if is.arg.Term < raft.currentTerm {
@@ -768,6 +870,11 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int) {
 		case sr := <-installSnapshotResponseChan:
 			if sr.err != nil {
 				log.Printf("Error calling RPC %v", sr.err)
+				break
+			}
+
+			if !raft.peerLive[sr.peer] {
+				log.Printf("%v not in current view, ignore", sr.peer)
 				break
 			}
 

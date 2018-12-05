@@ -51,6 +51,10 @@ message Result {
     }
 }
 
+message Peer {
+    string peer = 1;
+}
+
 // KvStore service
 service KvStore {
     // Get the value associated with a key.
@@ -58,6 +62,8 @@ service KvStore {
     rpc Set (KeyValue) returns (Result) {}
     rpc Clear(Empty) returns (Result) {}
     rpc CAS(CASArg) returns (Result) {}
+    rpc PeerJoin (Peer) returns (Result) {}
+    rpc PeerLeave (Peer) returns (Result) {}
 }
 
 // Internal representations for operations.
@@ -66,7 +72,10 @@ enum Op {
     SET = 1;
     CLEAR = 2;
     CAS = 3;
+    PeerJoin = 4;
+    PeerLeave = 5;
 }
+
 
 // A type for arguments across all operations
 message Command {
@@ -76,6 +85,7 @@ message Command {
         KeyValue set = 3;
         Empty clear = 4;
         CASArg cas = 5;
+        Peer peerJoinLeave = 6;
     }
 }
 

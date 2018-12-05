@@ -20,6 +20,24 @@ type KVStore struct {
 	store map[string]string
 }
 
+func (s *KVStore) PeerJoin(ctx context.Context, peer *pb.Peer) (*pb.Result, error) {
+	c := make(chan pb.Result)
+	r := pb.Command{Operation: pb.Op_PeerJoin, Arg: &pb.Command_PeerJoinLeave{PeerJoinLeave: peer}}
+	s.C <- InputChannelType{command: r, response: c}
+	log.Printf("Waiting for peer join response")
+	result := <-c
+	return &result, nil
+}
+
+func (s *KVStore) PeerLeave(ctx context.Context, peer *pb.Peer) (*pb.Result, error) {
+	c := make(chan pb.Result)
+	r := pb.Command{Operation: pb.Op_PeerLeave, Arg: &pb.Command_PeerJoinLeave{PeerJoinLeave: peer}}
+	s.C <- InputChannelType{command: r, response: c}
+	log.Printf("Waiting for peer join response")
+	result := <-c
+	return &result, nil
+}
+
 func (s *KVStore) Get(ctx context.Context, key *pb.Key) (*pb.Result, error) {
 	// Create a channel
 	c := make(chan pb.Result)
