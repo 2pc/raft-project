@@ -132,7 +132,8 @@ message InstallSnapshotArgs {
     string leaderID = 2;
     int64 lastIncludedIndex = 3;
     int64 lastIncludedTerm = 4;
-    repeated KeyValue data = 5;
+    bytes serviceData = 5;
+    bytes raftData = 6;
 }
 
 message InstallSnapshotRet {

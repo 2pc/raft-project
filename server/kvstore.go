@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bytes"
+	"encoding/gob"
 	"log"
 
 	context "golang.org/x/net/context"
@@ -127,23 +129,22 @@ func (s *KVStore) CasInternal(k string, v string, vn string) pb.Result {
 
 // Used internally to dump out all the values
 // Could be used as creating snapshot or shard migration
-func (s *KVStore) DumpInternal() []*pb.KeyValue {
+func (s *KVStore) CreateSnapshot() []byte {
 	log.Printf("Dump out all the values from KV store")
-	kvdump := make([]*pb.KeyValue, 0)
-	for k, v := range s.store {
-		kvdump = append(kvdump, &pb.KeyValue{Key: k, Value: v})
-	}
-	return kvdump
+	write := new(bytes.Buffer)
+	encoder := gob.NewEncoder(write)
+	encoder.Encode(s.store)
+	snapshot := write.Bytes()
+	return snapshot
 }
 
 // Used internall to restore from a snapshot
 // WARNING: this will force clean the store
-func (s *KVStore) RestoreSnapshot(kvdump []*pb.KeyValue) {
+func (s *KVStore) RestoreSnapshot(snapshot []byte) {
 	log.Printf("Restore all value from a snapshot")
-	s.store = make(map[string]string)
-	for _, kv := range kvdump {
-		s.store[kv.Key] = s.store[kv.Value]
-	}
+	read := bytes.NewBuffer(snapshot)
+	decoder := gob.NewDecoder(read)
+	decoder.Decode(&s.store)
 }
 
 func (s *KVStore) HandleCommand(op InputChannelType) {

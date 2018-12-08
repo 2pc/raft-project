@@ -1,10 +1,13 @@
 package main
 
 import (
+	"bytes"
+	"encoding/gob"
 	"fmt"
 	"log"
 	rand "math/rand"
 	"net"
+	"os"
 	"strings"
 	"time"
 
@@ -15,7 +18,7 @@ import (
 )
 
 const (
-	LOG_LIMIT                    = 30
+	LOG_LIMIT                    = 5
 	ELECTION_TIMEOUT_UPPER_BOUND = 20000
 	ELECTION_TIMEOUT_LOWER_BOUND = 5000
 	HEARTBEAT_TIMEOUT            = 1000
@@ -69,7 +72,7 @@ type Raft struct {
 
 	state      int // 0:follower 1:candidate 2:leader
 	voteCount  int // count of votes we have got
-	numPeers   int // total number of peers in the system
+	numPeers   int // total number of living peers in the system (including myself)
 	majorCount int // = numPeers/2 + 1
 
 	peerLive map[string]bool
@@ -88,9 +91,10 @@ type Raft struct {
 	lastApplied int64
 
 	// snapshot related
-	snapshotData      []*pb.KeyValue
-	lastIncludedIndex int64
-	lastIncludedTerm  int64
+	snapshotServiceData []byte
+	snapshotRaftData    []byte
+	lastIncludedIndex   int64
+	lastIncludedTerm    int64
 
 	// ----------------------- volatile on the leaders ------------------------------------
 	// Should be re-initilize after election
@@ -211,9 +215,17 @@ func connectToPeer(peer string) (pb.RaftClient, error) {
 
 func createSnapShot(r *Raft, s *KVStore) {
 	// pull out all data, we don't have a disk, thus we just store them in memory
-	r.snapshotData = s.DumpInternal()
+	r.snapshotServiceData = s.CreateSnapshot()
 	r.lastIncludedIndex = r.lastApplied
 	r.lastIncludedTerm = r.log[r.lastApplied-r.firstLogIndex].Term
+
+	// we also need to pack data from raft state, if any
+	write := new(bytes.Buffer)
+	encoder := gob.NewEncoder(write)
+	encoder.Encode(r.numPeers)
+	encoder.Encode(r.majorCount)
+	encoder.Encode(r.peerLive)
+	r.snapshotRaftData = write.Bytes()
 
 	// now, we discard all the executed logs so far.
 	// WARNING: CARFULLY CHECK THE INDEX(-1, +1) HERE
@@ -231,7 +243,8 @@ func sendSnapShot(raft *Raft, p string, c pb.RaftClient, installSnapshotResponse
 		LeaderID:          raft.id,
 		LastIncludedIndex: raft.lastIncludedIndex,
 		LastIncludedTerm:  raft.lastIncludedTerm,
-		Data:              raft.snapshotData,
+		ServiceData:       raft.snapshotServiceData,
+		RaftData:          raft.snapshotRaftData,
 	}
 	go func(c pb.RaftClient,
 		p string,
@@ -288,7 +301,7 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int) {
 
 		state:      0,
 		voteCount:  0,
-		numPeers:   len(*peers),
+		numPeers:   len(*peers) + 1, // for the symmetric purpose, including myself
 		majorCount: (len(*peers)+1)/2 + 1,
 
 		peerLive: make(map[string]bool),
@@ -303,9 +316,10 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int) {
 		commitIndex: -1,
 		lastApplied: -1,
 
-		snapshotData:      make([]*pb.KeyValue, 0),
-		lastIncludedIndex: -1,
-		lastIncludedTerm:  -1,
+		snapshotServiceData: make([]byte, 0),
+		snapshotRaftData:    make([]byte, 0),
+		lastIncludedIndex:   -1,
+		lastIncludedTerm:    -1,
 
 		nextIndex:     nil,
 		matchIndex:    nil,
@@ -488,7 +502,7 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int) {
 					joinpeer := nextLog.GetPeerJoinLeave().Peer
 					if !raft.peerLive[joinpeer] {
 						raft.numPeers += 1
-						raft.majorCount = (raft.numPeers+1)/2 + 1
+						raft.majorCount = raft.numPeers/2 + 1
 						raft.peerLive[joinpeer] = true
 					}
 					continue
@@ -497,10 +511,11 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int) {
 					leavepeer := nextLog.GetPeerJoinLeave().Peer
 					if leavepeer == raft.id {
 						// I should leave....shut down
-						log.Fatalf("I'm forcing to leave the cluster, bye")
+						log.Printf("I'm forcing to leave the cluster, bye")
+						os.Exit(0)
 					} else if raft.peerLive[leavepeer] {
 						raft.numPeers -= 1
-						raft.majorCount = (raft.numPeers+1)/2 + 1
+						raft.majorCount = raft.numPeers/2 + 1
 						raft.peerLive[leavepeer] = false
 					}
 					continue
@@ -689,11 +704,11 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int) {
 								count += 1
 							}
 						}
-						if count >= (raft.numPeers+2)/2+1 {
+						if count >= (raft.numPeers+1)/2+1 {
 							joinpeer := nextLog.GetPeerJoinLeave().Peer
 							if !raft.peerLive[joinpeer] {
 								raft.numPeers += 1
-								raft.majorCount = (raft.numPeers+1)/2 + 1
+								raft.majorCount = raft.numPeers/2 + 1
 								raft.peerLive[joinpeer] = true
 							}
 						} else {
@@ -707,14 +722,14 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int) {
 								count += 1
 							}
 						}
-						if count >= (raft.numPeers+2)/2+1 {
+						if count >= (raft.numPeers+1)/2+1 {
 							leavepeer := nextLog.GetPeerJoinLeave().Peer
 							if leavepeer == raft.id {
 								// I should leave....shut down
 								log.Fatalf("I'm forcing to leave the cluster, bye")
 							} else if raft.peerLive[leavepeer] {
 								raft.numPeers -= 1
-								raft.majorCount = (raft.numPeers+1)/2 + 1
+								raft.majorCount = raft.numPeers/2 + 1
 								raft.peerLive[leavepeer] = false
 							}
 						} else {
@@ -865,16 +880,24 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int) {
 			}
 
 			log.Printf("Reset server state using the snapshot")
-			s.RestoreSnapshot(is.arg.Data)
+			s.RestoreSnapshot(is.arg.ServiceData)
 			raft.log = make([]*pb.Entry, 0)
 			raft.firstLogIndex = is.arg.LastIncludedIndex + 1
 			raft.lastLogIndex = is.arg.LastIncludedIndex
 			raft.lastLogTerm = is.arg.LastIncludedTerm
 			raft.commitIndex = is.arg.LastIncludedIndex
 			raft.lastApplied = is.arg.LastIncludedIndex
-			raft.snapshotData = is.arg.Data
+			raft.snapshotServiceData = is.arg.ServiceData
+			raft.snapshotRaftData = is.arg.RaftData
 			raft.lastIncludedIndex = is.arg.LastIncludedIndex
 			raft.lastIncludedTerm = is.arg.LastIncludedTerm
+
+			// recover raft data, if any
+			read := bytes.NewBuffer(is.arg.RaftData)
+			decoder := gob.NewDecoder(read)
+			decoder.Decode(&raft.numPeers)
+			decoder.Decode(&raft.majorCount)
+			decoder.Decode(&raft.peerLive)
 
 			is.response <- pb.InstallSnapshotRet{Term: raft.currentTerm}
 
