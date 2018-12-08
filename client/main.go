@@ -5,7 +5,10 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"strconv"
+	"os/exec"
+	"strings"
+	"regexp"
+	// "strconv"
 
 	context "golang.org/x/net/context"
 	"google.golang.org/grpc"
@@ -14,19 +17,151 @@ import (
 )
 
 func usage() {
-	fmt.Printf("Usage %s <endpoint>\n", os.Args[0])
+	fmt.Printf("Usage %s <dummytest/test/multitest/join/leave>\n", os.Args[0])
 	flag.PrintDefaults()
 }
 
-func CheckConcurrent(total int, c chan int) int {
-	count := 0
-	for i := 0; i < total; i++ {
-		count += (<-c)
+func getKVServiceURL(peer string) string {
+	cmd := exec.Command("../launch-tool/launch.py", "client-url", peer)
+	stdout, err := cmd.Output()
+	if err != nil {
+		log.Fatalf("Cannot get the service URL.peer: %v, err:%v", peer, err)
 	}
-	return count
+	endpoint := strings.Trim(string(stdout), "\n")
+	return endpoint
 }
 
-func RunConcurrentCAS(endpoint string) {
+func listAvailRaftServer() []string {
+	cmd := exec.Command("../launch-tool/launch.py", "list")
+	stdout, err := cmd.Output()
+	if err != nil {
+		log.Fatalf("Cannot list Raft servers.")
+	}
+	re := regexp.MustCompile("peer[0-9]+")
+	peers := re.FindAllString(string(stdout), -1)
+	return peers
+}
+
+func getServerAtNextIndex(allServer []string, serverIndex *int) string {
+	if *serverIndex > len(allServer) {
+		*serverIndex = 0
+	}
+	return getKVServiceURL(allServer[*serverIndex])
+}
+
+func getKvcAtNextIndex(allServer []string, serverIndex *int) pb.KvStoreClient {
+	endpoint := getServerAtNextIndex(allServer, serverIndex)
+	conn, err := grpc.Dial(endpoint, grpc.WithInsecure())
+	if err != nil {
+		return getKvcAtNextIndex(allServer, serverIndex)
+	}
+	// Create a KvStore client
+	kvc := pb.NewKvStoreClient(conn)
+	return kvc
+}
+
+func getKvcAtRedirect(endpoint string, allServer []string, serverIndex *int) pb.KvStoreClient {
+	conn, err := grpc.Dial(endpoint, grpc.WithInsecure())
+	if err != nil {
+		return getKvcAtNextIndex(allServer, serverIndex)
+	}
+	// Create a KvStore client
+	kvc := pb.NewKvStoreClient(conn)
+	return kvc
+}
+
+func single_checker(key string, allServer []string) {
+	serverIndex := 0
+	kvc := getKvcAtNextIndex(allServer, &serverIndex)
+	flag := false
+	for {
+		flag = true
+		for flag {
+			// Put setting key -> 1
+			putReq := &pb.KeyValue{Key: key, Value: "1"}
+			res, err := kvc.Set(context.Background(), putReq)
+			if err != nil {
+				kvc = getKvcAtNextIndex(allServer, &serverIndex)
+				continue
+			}
+			if redirect := res.GetRedirect(); redirect != nil {
+				log.Printf("Got redirect response: %v", redirect.Server)
+				kvc = getKvcAtRedirect(redirect.Server, allServer, &serverIndex)
+				continue
+			}
+			log.Printf("Got response key: \"%v\" value:\"%v\"", res.GetKv().Key, res.GetKv().Value)
+			if res.GetKv().Key != key || res.GetKv().Value != "1" {
+				log.Fatalf("Put returned the wrong response")
+			}
+			flag = false
+		}
+
+		flag = true
+		for flag {
+			// Request value for key
+			req := &pb.Key{Key: key}
+			res, err := kvc.Get(context.Background(), req)
+			if err != nil {
+				kvc = getKvcAtNextIndex(allServer, &serverIndex)
+				continue
+			}
+			if redirect := res.GetRedirect(); redirect != nil {
+				log.Printf("Got redirect response: %v", redirect.Server)
+				kvc = getKvcAtRedirect(redirect.Server, allServer, &serverIndex)
+				continue
+			}
+			log.Printf("Got response key: \"%v\" value:\"%v\"", res.GetKv().Key, res.GetKv().Value)
+			if res.GetKv().Key != key || res.GetKv().Value != "1" {
+				log.Fatalf("Get returned the wrong response")
+			}
+			flag = false
+		}
+
+		flag = true
+		for flag {
+			// Successfully CAS changing key -> 2
+			casReq := &pb.CASArg{Kv: &pb.KeyValue{Key: key, Value: "1"}, Value: &pb.Value{Value: "2"}}
+			res, err := kvc.CAS(context.Background(), casReq)
+			if err != nil {
+				kvc = getKvcAtNextIndex(allServer, &serverIndex)
+				continue
+			}
+			if redirect := res.GetRedirect(); redirect != nil {
+				log.Printf("Got redirect response: %v", redirect.Server)
+				kvc = getKvcAtRedirect(redirect.Server, allServer, &serverIndex)
+				continue
+			}
+			log.Printf("Got response key: \"%v\" value:\"%v\"", res.GetKv().Key, res.GetKv().Value)
+			if res.GetKv().Key != key || res.GetKv().Value != "2" {
+				log.Fatalf("CAS returned the wrong response")
+			}
+			flag = false
+		}
+
+		flag = true
+		for flag {
+			// Unsuccessfully CAS
+			casReq := &pb.CASArg{Kv: &pb.KeyValue{Key: key, Value: "1"}, Value: &pb.Value{Value: "3"}}
+			res, err := kvc.CAS(context.Background(), casReq)
+			if err != nil {
+				kvc = getKvcAtNextIndex(allServer, &serverIndex)
+				continue
+			}
+			if redirect := res.GetRedirect(); redirect != nil {
+				log.Printf("Got redirect response: %v", redirect.Server)
+				kvc = getKvcAtRedirect(redirect.Server, allServer, &serverIndex)
+				continue
+			}
+			log.Printf("Got response key: \"%v\" value:\"%v\"", res.GetKv().Key, res.GetKv().Value)
+			if res.GetKv().Key != key || res.GetKv().Value == "3" {
+				log.Fatalf("CAS returned the wrong response")
+			}
+			flag = false
+		}
+	}
+}
+
+func dummytest(endpoint string) {
 	log.Printf("Connecting to %v", endpoint)
 	// Connect to the server. We use WithInsecure since we do not configure https in this class.
 	conn, err := grpc.Dial(endpoint, grpc.WithInsecure())
@@ -35,89 +170,6 @@ func RunConcurrentCAS(endpoint string) {
 		log.Fatalf("Failed to dial GRPC server %v", err)
 	}
 	log.Printf("Connected")
-
-	// Create a KvStore client
-	kvc := pb.NewKvStoreClient(conn)
-
-	// Clear KVC
-	res, err := kvc.Clear(context.Background(), &pb.Empty{})
-	if err != nil {
-		log.Fatalf("Could not clear")
-	}
-
-	// Just fire a bunch of CAS operation, where only 1 should be succeed
-	putReq := &pb.KeyValue{Key: "x", Value: "y"}
-	res, err = kvc.Set(context.Background(), putReq)
-	if err != nil {
-		log.Fatalf("Put error")
-	}
-	log.Printf("Got response key: \"%v\" value:\"%v\"", res.GetKv().Key, res.GetKv().Value)
-	if res.GetKv().Key != "x" || res.GetKv().Value != "y" {
-		log.Fatalf("Put returned the wrong response")
-	}
-
-	total := 100
-	c := make(chan int, total)
-	for i := 0; i < total; i++ {
-		go func(value int) {
-
-			// log.Printf("Connecting to %v", endpoint)
-			// Connect to the server. We use WithInsecure since we do not configure https in this class.
-			conn, err := grpc.Dial(endpoint, grpc.WithInsecure())
-			//Ensure connection did not fail.
-			if err != nil {
-				log.Printf("Failed to dial GRPC server %v", err)
-				return
-			}
-			// log.Printf("Connected")
-
-			// Create a KvStore client
-			kvc := pb.NewKvStoreClient(conn)
-
-			newValue := strconv.Itoa(value)
-			// Successfully CAS changing y -> newValue
-			casReq := &pb.CASArg{Kv: &pb.KeyValue{Key: "x", Value: "y"}, Value: &pb.Value{Value: newValue}}
-			res, err = kvc.CAS(context.Background(), casReq)
-			if err != nil {
-				log.Printf("Request error %v", err)
-				return
-			}
-			// log.Printf("Got response key: \"%v\" value:\"%v\"", res.GetKv().Key, res.GetKv().Value)
-			if res.GetKv().Value == newValue {
-				c <- 1
-			} else {
-				c <- 0
-			}
-		}(i)
-	}
-
-	// Check only one CAS succeed
-	if count := CheckConcurrent(total, c); count != 1 {
-		log.Fatalf("Expected 1 but got %v", count)
-	} else {
-		log.Printf("Passed!")
-	}
-}
-
-func main() {
-	// Take endpoint as input
-	flag.Usage = usage
-	flag.Parse()
-	// If there is no endpoint fail
-	if flag.NArg() == 0 {
-		flag.Usage()
-		os.Exit(1)
-	}
-	endpoint := flag.Args()[0]
-	//RunConcurrentCAS(endpoint)
-	log.Printf("Connecting to %v", endpoint)
-	// Connect to the server. We use WithInsecure since we do not configure https in this class.
-	conn, err := grpc.Dial(endpoint, grpc.WithInsecure())
-	//Ensure connection did not fail.
-	if err != nil {
-		log.Fatalf("Failed to dial GRPC server %v", err)
-	}
-	log.Printf("Connected")
 	// Create a KvStore client
 	kvc := pb.NewKvStoreClient(conn)
 	// Clear KVC
@@ -125,7 +177,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("Could not clear")
 	}
-	if redirect := res.GetRedirect(); redirect != nil{
+	if redirect := res.GetRedirect(); redirect != nil {
 		log.Printf("Got redirect response: %v", redirect.Server)
 		return
 	}
@@ -183,5 +235,27 @@ func main() {
 	log.Printf("Got response key: \"%v\" value:\"%v\"", res.GetKv().Key, res.GetKv().Value)
 	if res.GetKv().Key != "hellooo" || res.GetKv().Value == "2" {
 		log.Fatalf("Get returned the wrong response")
+	}
+}
+
+func main() {
+	// Take endpoint as input
+	flag.Usage = usage
+	flag.Parse()
+	// If there is no option fail
+	if flag.NArg() == 0 {
+		flag.Usage()
+		os.Exit(1)
+	}
+	optype := flag.Args()[0]
+	switch optype {
+	case "dummytest":
+		endpoint := flag.Args()[1]
+		dummytest(endpoint)
+	case "test":
+		single_checker("hello", listAvailRaftServer())
+	default:
+		flag.Usage()
+		os.Exit(1)
 	}
 }

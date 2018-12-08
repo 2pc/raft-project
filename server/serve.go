@@ -14,6 +14,13 @@ import (
 	"github.com/nyu-distributed-systems-fa18/raft-extension/pb"
 )
 
+const (
+	LOG_LIMIT                    = 30
+	ELECTION_TIMEOUT_UPPER_BOUND = 20000
+	ELECTION_TIMEOUT_LOWER_BOUND = 5000
+	HEARTBEAT_TIMEOUT            = 1000
+)
+
 // Messages that can be passed from the Raft RPC server to the main loop for AppendEntries
 type AppendEntriesInput struct {
 	arg      *pb.AppendEntriesArgs
@@ -141,13 +148,13 @@ func (r *Raft) InstallSnapshot(ctx context.Context, arg *pb.InstallSnapshotArgs)
 
 // Compute a random duration in milliseconds
 func randomDuration(r *rand.Rand) time.Duration {
-	const DurationMax = 20000
-	const DurationMin = 5000
+	const DurationMax = ELECTION_TIMEOUT_UPPER_BOUND
+	const DurationMin = ELECTION_TIMEOUT_LOWER_BOUND
 	return time.Duration(r.Intn(DurationMax-DurationMin)+DurationMin) * time.Millisecond
 }
 
 // Restart the supplied timer using a random timeout based on function above
-func restartTimer(timer *time.Timer, r *rand.Rand, isHeartbeat bool) {
+func restartElectionTimer(timer *time.Timer, r *rand.Rand) {
 	stopped := timer.Stop()
 	// If stopped is false that means someone stopped before us, which could be due to the timer going off before this,
 	// in which case we just drain notifications.
@@ -157,12 +164,18 @@ func restartTimer(timer *time.Timer, r *rand.Rand, isHeartbeat bool) {
 			<-timer.C
 		}
 	}
+	timer.Reset(randomDuration(r))
+}
 
-	if isHeartbeat {
-		timer.Reset(1000 * time.Millisecond)
-	} else {
-		timer.Reset(randomDuration(r))
+func restartHeartbeatTimer(timer *time.Timer) {
+	stopped := timer.Stop()
+	if !stopped {
+		// Loop for any queued notifications
+		for len(timer.C) > 0 {
+			<-timer.C
+		}
 	}
+	timer.Reset(time.Duration(HEARTBEAT_TIMEOUT * time.Millisecond))
 }
 
 // Launch a GRPC service for this Raft peer.
@@ -307,6 +320,7 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int) {
 
 	peerClients := make(map[string]pb.RaftClient)
 
+	raft.peerLive[id + ":" + string(port)] = true
 	for _, peer := range *peers {
 		client, err := connectToPeer(peer)
 		if err != nil {
@@ -322,14 +336,15 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int) {
 	voteResponseChan := make(chan VoteResponse)
 	installSnapshotResponseChan := make(chan InstallShapshotResponse)
 
-	// Create a timer and start running it
-	timer := time.NewTimer(randomDuration(r))
+	// Create the timers and start running it
+	electionTimer := time.NewTimer(randomDuration(r))
+	heartbeatTimer := time.NewTimer(HEARTBEAT_TIMEOUT * time.Millisecond)
 
 	// Run forever handling inputs from various channels
 	for {
 		select {
-		case <-timer.C:
-			// The timer went off.
+		case <-electionTimer.C:
+			// The election timer went off.
 			if raft.state == 0 || raft.state == 1 {
 				log.Printf("Timeout, start a new round of election with term %v", raft.currentTerm+1)
 
@@ -357,15 +372,16 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int) {
 						voteResponseChan <- VoteResponse{ret: ret, arg: args, err: err, peer: p}
 					}(c, p, &args)
 				}
-				// This will also take care of any pesky timeouts that happened while processing the operation.
-				restartTimer(timer, r, false)
-			} else {
+			}
+			// This will also take care of any pesky timeouts that happened while processing the operation.
+			restartElectionTimer(electionTimer, r)
+
+		case <-heartbeatTimer.C:
+			if raft.state == 2 {
 				log.Printf("Leader trigger a new round of heatbeat messages with term %v", raft.currentTerm)
 				broadcastHeartbeat(&raft, &peerClients, &appendResponseChan, &installSnapshotResponseChan)
-
-				// This would be a heartbeat timer
-				restartTimer(timer, r, true)
 			}
+			restartHeartbeatTimer(heartbeatTimer)
 
 		case op := <-s.C:
 			if raft.state == 0 {
@@ -511,7 +527,7 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int) {
 
 			ae.response <- pb.AppendEntriesRet{Term: raft.currentTerm, Success: true}
 			// This will also take care of any pesky timeouts that happened while processing the operation.
-			restartTimer(timer, r, false)
+			restartElectionTimer(electionTimer, r)
 
 		case vr := <-raft.VoteChan:
 			// We received a RequestVote RPC from a raft peer
@@ -519,6 +535,7 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int) {
 
 			if !raft.peerLive[vr.arg.CandidateID] {
 				log.Printf("%v not in current view, ignore", vr.arg.CandidateID)
+				log.Print(raft.peerLive)
 				break
 			}
 
@@ -550,7 +567,7 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int) {
 						vr.response <- pb.RequestVoteRet{Term: raft.currentTerm, VoteGranted: true}
 
 						// reset timer
-						restartTimer(timer, r, false)
+						restartElectionTimer(electionTimer, r)
 					} else {
 						log.Printf("Reject %v 's vote request - already granted to others", vr.arg.CandidateID)
 						vr.response <- pb.RequestVoteRet{Term: raft.currentTerm, VoteGranted: false}
@@ -584,7 +601,7 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int) {
 					raft.votedFor = ""
 					raft.voteCount = 0
 					raft.state = 0
-					restartTimer(timer, r, false)
+					restartElectionTimer(electionTimer, r)
 				}
 
 				if vr.arg.Term < raft.currentTerm {
@@ -619,7 +636,7 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int) {
 						broadcastHeartbeat(&raft, &peerClients, &appendResponseChan, &installSnapshotResponseChan)
 
 						// This would be a heartbeat timer
-						restartTimer(timer, r, true)
+						restartHeartbeatTimer(heartbeatTimer)
 					}
 				}
 			}
@@ -644,7 +661,7 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int) {
 				raft.votedFor = ""
 				raft.voteCount = 0
 				raft.state = 0
-				restartTimer(timer, r, false)
+				restartElectionTimer(electionTimer, r)
 			}
 
 			if raft.state != 2 {
@@ -865,7 +882,7 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int) {
 			is.response <- pb.InstallSnapshotRet{Term: raft.currentTerm}
 
 			// restart timer
-			restartTimer(timer, r, false)
+			restartElectionTimer(electionTimer, r)
 
 		case sr := <-installSnapshotResponseChan:
 			if sr.err != nil {
@@ -885,7 +902,7 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int) {
 				raft.votedFor = ""
 				raft.voteCount = 0
 				raft.state = 0
-				restartTimer(timer, r, false)
+				restartElectionTimer(electionTimer, r)
 			}
 
 			if sr.arg.Term < raft.currentTerm {

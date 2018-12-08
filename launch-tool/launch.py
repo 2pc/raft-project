@@ -132,7 +132,7 @@ def get_service_url(args):
     v1 = init()
     ip = subprocess.run('minikube ip', check=True, stdout=subprocess.PIPE, shell=True).stdout\
             .decode('utf-8').strip()
-    svcs = get_service(v1, "peer%d"%args.peer)
+    svcs = get_service(v1, args.peer)
     if len(svcs.items) != 1:
         print("Could not find service", file=sys.stderr)
         sys.exit(1)
@@ -171,7 +171,7 @@ def main():
     kill_parser.set_defaults(func=launch)
 
     svc_parser = subparsers.add_parser("client-url")
-    svc_parser.add_argument('peer', type=int, help="Which peer do you need URL for")
+    svc_parser.add_argument('peer', type=str, help="Which peer do you need URL for")
     svc_parser.set_defaults(func=get_service_url)
 
     args = parser.parse_args()
