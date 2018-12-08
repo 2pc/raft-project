@@ -92,9 +92,6 @@ type Raft struct {
 	lastIncludedIndex int64
 	lastIncludedTerm  int64
 
-	// each time we reach this limit, we will compact current COMMIT POINT state into the snapshot
-	maxCommitLog int64
-
 	// ----------------------- volatile on the leaders ------------------------------------
 	// Should be re-initilize after election
 
@@ -309,7 +306,6 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int) {
 		snapshotData:      make([]*pb.KeyValue, 0),
 		lastIncludedIndex: -1,
 		lastIncludedTerm:  -1,
-		maxCommitLog:      5, // temporally we set a quite small value to see the effect :)
 
 		nextIndex:     nil,
 		matchIndex:    nil,
@@ -320,7 +316,7 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int) {
 
 	peerClients := make(map[string]pb.RaftClient)
 
-	raft.peerLive[id + ":" + string(port)] = true
+	raft.peerLive[id] = true
 	for _, peer := range *peers {
 		client, err := connectToPeer(peer)
 		if err != nil {
@@ -331,6 +327,8 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int) {
 		raft.peerLive[peer] = true
 		log.Printf("Connected to %v", peer)
 	}
+
+	log.Print(raft.peerLive)
 
 	appendResponseChan := make(chan AppendResponse)
 	voteResponseChan := make(chan VoteResponse)
@@ -521,7 +519,7 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int) {
 			}
 
 			// if we have enough executed commands, we create a snapshot
-			if raft.lastApplied-raft.firstLogIndex+1 > raft.maxCommitLog {
+			if raft.lastApplied-raft.firstLogIndex+1 > LOG_LIMIT {
 				createSnapShot(&raft, s)
 			}
 
@@ -535,7 +533,6 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int) {
 
 			if !raft.peerLive[vr.arg.CandidateID] {
 				log.Printf("%v not in current view, ignore", vr.arg.CandidateID)
-				log.Print(raft.peerLive)
 				break
 			}
 
@@ -766,7 +763,7 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int) {
 				}
 
 				// 4. if we have enough executed commands, we create a snapshot
-				if raft.lastApplied-raft.firstLogIndex+1 > raft.maxCommitLog {
+				if raft.lastApplied-raft.firstLogIndex+1 > LOG_LIMIT {
 					createSnapShot(&raft, s)
 				}
 

@@ -6,8 +6,8 @@ import (
 	"log"
 	"os"
 	"os/exec"
-	"strings"
 	"regexp"
+	"strings"
 	// "strconv"
 
 	context "golang.org/x/net/context"
@@ -21,14 +21,14 @@ func usage() {
 	flag.PrintDefaults()
 }
 
-func getKVServiceURL(peer string) string {
+func getKVServiceURL(peer string) (string, error) {
 	cmd := exec.Command("../launch-tool/launch.py", "client-url", peer)
 	stdout, err := cmd.Output()
 	if err != nil {
-		log.Fatalf("Cannot get the service URL.peer: %v, err:%v", peer, err)
+		return "", err
 	}
 	endpoint := strings.Trim(string(stdout), "\n")
-	return endpoint
+	return endpoint, nil
 }
 
 func listAvailRaftServer() []string {
@@ -43,16 +43,25 @@ func listAvailRaftServer() []string {
 }
 
 func getServerAtNextIndex(allServer []string, serverIndex *int) string {
-	if *serverIndex > len(allServer) {
+	endpoint, err := getKVServiceURL(allServer[*serverIndex])
+	*serverIndex += 1
+	if *serverIndex >= len(allServer) {
 		*serverIndex = 0
 	}
-	return getKVServiceURL(allServer[*serverIndex])
+	if err != nil {
+		return getServerAtNextIndex(allServer, serverIndex)
+	}
+	return endpoint
 }
 
 func getKvcAtNextIndex(allServer []string, serverIndex *int) pb.KvStoreClient {
 	endpoint := getServerAtNextIndex(allServer, serverIndex)
 	conn, err := grpc.Dial(endpoint, grpc.WithInsecure())
 	if err != nil {
+		*serverIndex += 1
+		if *serverIndex >= len(allServer) {
+			*serverIndex = 0
+		}
 		return getKvcAtNextIndex(allServer, serverIndex)
 	}
 	// Create a KvStore client
@@ -60,7 +69,11 @@ func getKvcAtNextIndex(allServer []string, serverIndex *int) pb.KvStoreClient {
 	return kvc
 }
 
-func getKvcAtRedirect(endpoint string, allServer []string, serverIndex *int) pb.KvStoreClient {
+func getKvcAtRedirect(peer string, allServer []string, serverIndex *int) pb.KvStoreClient {
+	endpoint, err := getKVServiceURL(peer)
+	if err != nil {
+		return getKvcAtNextIndex(allServer, serverIndex)
+	}
 	conn, err := grpc.Dial(endpoint, grpc.WithInsecure())
 	if err != nil {
 		return getKvcAtNextIndex(allServer, serverIndex)
@@ -161,9 +174,13 @@ func single_checker(key string, allServer []string) {
 	}
 }
 
-func dummytest(endpoint string) {
-	log.Printf("Connecting to %v", endpoint)
+func dummytest(peer string) {
+	log.Printf("Connecting to %v", peer)
 	// Connect to the server. We use WithInsecure since we do not configure https in this class.
+	endpoint, err := getKVServiceURL(peer)
+	if err != nil {
+		log.Fatalf("Failed to dial GRPC server %v", err)
+	}
 	conn, err := grpc.Dial(endpoint, grpc.WithInsecure())
 	//Ensure connection did not fail.
 	if err != nil {
@@ -253,7 +270,8 @@ func main() {
 		endpoint := flag.Args()[1]
 		dummytest(endpoint)
 	case "test":
-		single_checker("hello", listAvailRaftServer())
+		key := flag.Args()[1]
+		single_checker(key, listAvailRaftServer())
 	default:
 		flag.Usage()
 		os.Exit(1)
