@@ -505,6 +505,8 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int) {
 						raft.majorCount = raft.numPeers/2 + 1
 						raft.peerLive[joinpeer] = true
 					}
+					log.Printf("Peer %v joined cluster, cluster now: %v", joinpeer, raft.peerLive)
+					raft.lastApplied = nextApply
 					continue
 				} else if nextLog.Operation == pb.Op_PeerLeave {
 					// a node leave
@@ -518,6 +520,8 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int) {
 						raft.majorCount = raft.numPeers/2 + 1
 						raft.peerLive[leavepeer] = false
 					}
+					log.Printf("Peer %v leaved cluster, cluster now: %v", leavepeer, raft.peerLive)
+					raft.lastApplied = nextApply
 					continue
 				}
 				log.Printf("Try to execute log entry index id: %v", nextApply)
@@ -711,6 +715,8 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int) {
 								raft.majorCount = raft.numPeers/2 + 1
 								raft.peerLive[joinpeer] = true
 							}
+							log.Printf("Peer %v joined cluster, cluster now: %v", joinpeer, raft.peerLive)
+							raft.commitIndex = nextCommit
 						} else {
 							break
 						}
@@ -732,6 +738,8 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int) {
 								raft.majorCount = raft.numPeers/2 + 1
 								raft.peerLive[leavepeer] = false
 							}
+							log.Printf("Peer %v leaveded cluster, cluster now: %v", leavepeer, raft.peerLive)
+							raft.commitIndex = nextCommit
 						} else {
 							break
 						}

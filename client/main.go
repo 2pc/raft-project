@@ -174,6 +174,48 @@ func single_checker(key string, allServer []string) {
 	}
 }
 
+func sendJoin(peer string, allServer []string) {
+	serverIndex := 0
+	kvc := getKvcAtNextIndex(allServer, &serverIndex)
+	flag := true
+	for flag {
+		joinReq := &pb.Peer{Peer: peer}
+		res, err := kvc.PeerJoin(context.Background(), joinReq)
+		if err != nil {
+			kvc = getKvcAtNextIndex(allServer, &serverIndex)
+			continue
+		}
+		if redirect := res.GetRedirect(); redirect != nil {
+			log.Printf("Got redirect response: %v", redirect.Server)
+			kvc = getKvcAtRedirect(redirect.Server, allServer, &serverIndex)
+			continue
+		}
+		log.Printf("Join finish")
+		flag = false
+	}
+}
+
+func sendLeave(peer string, allServer []string) {
+	serverIndex := 0
+	kvc := getKvcAtNextIndex(allServer, &serverIndex)
+	flag := true
+	for flag {
+		leaveReq := &pb.Peer{Peer: peer}
+		res, err := kvc.PeerLeave(context.Background(), leaveReq)
+		if err != nil {
+			kvc = getKvcAtNextIndex(allServer, &serverIndex)
+			continue
+		}
+		if redirect := res.GetRedirect(); redirect != nil {
+			log.Printf("Got redirect response: %v", redirect.Server)
+			kvc = getKvcAtRedirect(redirect.Server, allServer, &serverIndex)
+			continue
+		}
+		log.Printf("Leave Finish")
+		flag = false
+	}
+}
+
 func dummytest(peer string) {
 	log.Printf("Connecting to %v", peer)
 	// Connect to the server. We use WithInsecure since we do not configure https in this class.
@@ -260,7 +302,7 @@ func main() {
 	flag.Usage = usage
 	flag.Parse()
 	// If there is no option fail
-	if flag.NArg() == 0 {
+	if flag.NArg() != 2 {
 		flag.Usage()
 		os.Exit(1)
 	}
@@ -272,6 +314,12 @@ func main() {
 	case "test":
 		key := flag.Args()[1]
 		single_checker(key, listAvailRaftServer())
+	case "join":
+		peer := flag.Args()[1]
+		sendJoin(peer, listAvailRaftServer())
+	case "leave":
+		peer := flag.Args()[1]
+		sendLeave(peer, listAvailRaftServer())
 	default:
 		flag.Usage()
 		os.Exit(1)

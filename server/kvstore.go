@@ -164,6 +164,12 @@ func (s *KVStore) HandleCommand(op InputChannelType) {
 		arg := c.GetCas()
 		result := s.CasInternal(arg.Kv.Key, arg.Kv.Value, arg.Value.Value)
 		op.response <- result
+	case pb.Op_PeerJoin:
+		result := pb.Result{Result: &pb.Result_S{S: &pb.Success{}}}
+		op.response <- result
+	case pb.Op_PeerLeave:
+		result := pb.Result{Result: &pb.Result_S{S: &pb.Success{}}}
+		op.response <- result
 	default:
 		// Sending a blank response to just free things up, but we don't know how to make progress here.
 		op.response <- pb.Result{}
