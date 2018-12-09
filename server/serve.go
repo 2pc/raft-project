@@ -511,11 +511,7 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int) {
 				} else if nextLog.Operation == pb.Op_PeerLeave {
 					// a node leave
 					leavepeer := nextLog.GetPeerJoinLeave().Peer
-					if leavepeer == raft.id {
-						// I should leave....shut down
-						log.Printf("I'm forcing to leave the cluster, bye")
-						os.Exit(0)
-					} else if raft.peerLive[leavepeer] {
+					if raft.peerLive[leavepeer] {
 						raft.numPeers -= 1
 						raft.majorCount = raft.numPeers/2 + 1
 						raft.peerLive[leavepeer] = false
@@ -573,7 +569,7 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int) {
 
 			if vr.arg.Term >= raft.currentTerm {
 				// When should we accept a vote? safty requirements + not accept from others
-				if (vr.arg.LasLogTerm >= raft.lastLogTerm) ||
+				if (vr.arg.LasLogTerm > raft.lastLogTerm) ||
 					((vr.arg.LasLogTerm == raft.lastLogTerm) && (vr.arg.LastLogIndex >= raft.lastLogIndex)) {
 					if (raft.votedFor == "") || (raft.votedFor == vr.arg.CandidateID) {
 						log.Printf("Accpect %v 's vote request", vr.arg.CandidateID)
@@ -731,8 +727,9 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int) {
 						if count >= (raft.numPeers+1)/2+1 {
 							leavepeer := nextLog.GetPeerJoinLeave().Peer
 							if leavepeer == raft.id {
-								// I should leave....shut down
+								// I should leave....step down
 								log.Fatalf("I'm forcing to leave the cluster, bye")
+								os.Exit(0)
 							} else if raft.peerLive[leavepeer] {
 								raft.numPeers -= 1
 								raft.majorCount = raft.numPeers/2 + 1

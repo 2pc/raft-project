@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"regexp"
 	"strings"
+	"time"
 	// "strconv"
 
 	context "golang.org/x/net/context"
@@ -42,6 +43,11 @@ func listAvailRaftServer() []string {
 	return peers
 }
 
+func connToEndpoint(endpoint string) (*grpc.ClientConn, error) {
+	conn, err := grpc.Dial(endpoint, grpc.WithInsecure(), grpc.WithTimeout(5000*time.Millisecond))
+	return conn, err
+}
+
 func getServerAtNextIndex(allServer []string, serverIndex *int) string {
 	endpoint, err := getKVServiceURL(allServer[*serverIndex])
 	*serverIndex += 1
@@ -56,7 +62,7 @@ func getServerAtNextIndex(allServer []string, serverIndex *int) string {
 
 func getKvcAtNextIndex(allServer []string, serverIndex *int) pb.KvStoreClient {
 	endpoint := getServerAtNextIndex(allServer, serverIndex)
-	conn, err := grpc.Dial(endpoint, grpc.WithInsecure())
+	conn, err := connToEndpoint(endpoint)
 	if err != nil {
 		*serverIndex += 1
 		if *serverIndex >= len(allServer) {
@@ -74,7 +80,7 @@ func getKvcAtRedirect(peer string, allServer []string, serverIndex *int) pb.KvSt
 	if err != nil {
 		return getKvcAtNextIndex(allServer, serverIndex)
 	}
-	conn, err := grpc.Dial(endpoint, grpc.WithInsecure())
+	conn, err := connToEndpoint(endpoint)
 	if err != nil {
 		return getKvcAtNextIndex(allServer, serverIndex)
 	}
@@ -223,7 +229,7 @@ func dummytest(peer string) {
 	if err != nil {
 		log.Fatalf("Failed to dial GRPC server %v", err)
 	}
-	conn, err := grpc.Dial(endpoint, grpc.WithInsecure())
+	conn, err := connToEndpoint(endpoint)
 	//Ensure connection did not fail.
 	if err != nil {
 		log.Fatalf("Failed to dial GRPC server %v", err)
