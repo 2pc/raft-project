@@ -213,7 +213,7 @@ func connectToPeer(peer string) (pb.RaftClient, error) {
 	return pb.NewRaftClient(conn), nil
 }
 
-func createSnapShot(r *Raft, s *KVStore) {
+func createSnapShot(r *Raft, s *ShardMaster) {
 	// pull out all data, we don't have a disk, thus we just store them in memory
 	r.snapshotServiceData = s.CreateSnapshot()
 	r.lastIncludedIndex = r.lastApplied
@@ -291,7 +291,7 @@ func broadcastHeartbeat(raft *Raft, peerClients *map[string]pb.RaftClient,
 }
 
 // The main service loop. All modifications to the KV store are run through here.
-func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int) {
+func serve(s *ShardMaster, r *rand.Rand, peers *arrayPeers, id string, port int) {
 	raft := Raft{
 		id: id,
 

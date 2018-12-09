@@ -42,12 +42,33 @@ message Redirect {
     string server = 1;
 }
 
+message NotResponsible {
+}
+
+message GroupId {
+    int64 gid = 1;
+}
+
+message ConfigId {
+    int64 configId = 1;
+}
+
+message Reconfig {
+    ConfigId configId = 1;
+    GroupId src = 2;
+    GroupId dst = 3;
+    Key key = 4;
+}
+
 // Represents an operation result.
 message Result {
     oneof result {
         Redirect redirect = 1;
         KeyValue kv = 2;
         Success s = 3;
+        GroupId gid = 4;
+        Reconfig reconfig = 5;
+        NotResponsible notResponsible = 6;
     }
 }
 
@@ -55,16 +76,14 @@ message Peer {
     string peer = 1;
 }
 
-// KvStore service
-service KvStore {
-    // Get the value associated with a key.
-    rpc Get (Key) returns (Result) {}
-    rpc Set (KeyValue) returns (Result) {}
-    rpc Clear(Empty) returns (Result) {}
-    rpc CAS(CASArg) returns (Result) {}
-    rpc PeerJoin (Peer) returns (Result) {}
-    rpc PeerLeave (Peer) returns (Result) {}
+
+message ReconfigArgs {
+    Key key = 1;
+    GroupId destGid = 2;
 }
+
+// ---------------------------------------------------------------------------
+
 
 // Internal representations for operations.
 enum Op {
@@ -72,8 +91,21 @@ enum Op {
     SET = 1;
     CLEAR = 2;
     CAS = 3;
+    
+    // used for nodes join/leave cluster
     PeerJoin = 4;
     PeerLeave = 5;
+
+    // used for shardmaster
+    // here we re-use the GET command in shardmaster
+    RECONFIG = 6;
+    GETRECONFIG = 7;
+
+    // used for shardkv
+    GETKEY = 8;
+    DISABLEKEY = 9;
+    ENABLEKEY = 10;
+    UPDATECONFIG = 11;
 }
 
 
@@ -86,8 +118,30 @@ message Command {
         Empty clear = 4;
         CASArg cas = 5;
         Peer peerJoinLeave = 6;
+
+        // used for shardmaster
+        ReconfigArgs reconfig = 7;
+        ConfigId retriveReconfig = 8;
+
+        // used for shardkv
     }
 }
+
+// --------------------- Single cluster KV ---------------------
+
+// KvStore service
+service KvStore {
+    // Get the value associated with a key.
+    rpc Get (Key) returns (Result) {}
+    rpc Set (KeyValue) returns (Result) {}
+    rpc Clear(Empty) returns (Result) {}
+    rpc CAS(CASArg) returns (Result) {}
+    rpc PeerJoin (Peer) returns (Result) {}
+    rpc PeerLeave (Peer) returns (Result) {}
+}
+
+// -------------------------- Raft --------------------------
+
 
 // A log entry
 message Entry {
@@ -145,4 +199,12 @@ service Raft {
     rpc AppendEntries(AppendEntriesArgs) returns (AppendEntriesRet) {}
     rpc RequestVote(RequestVoteArgs) returns (RequestVoteRet) {}
     rpc InstallSnapshot(InstallSnapshotArgs) returns (InstallSnapshotRet) {}
+}
+
+// --------------------------- Shard Master -----------------------------------------------
+
+service ShardMaster {
+    rpc GetKeyGroup(Key) returns (Result) {}
+    rpc Reconfig(ReconfigArgs) returns (Result) {}
+    rpc GetReconfig(ConfigId) returns (Result) {}
 }
