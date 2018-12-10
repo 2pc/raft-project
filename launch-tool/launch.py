@@ -8,13 +8,17 @@ import subprocess
 import sys
 import yaml
 
+def peer_name_to_group_peer(peer_name):
+    tmp = peer_name.split('-')
+    return tmp[1], tmp[2]
+
 def find_pods(v1):
-    """Find pods started by us or at least running raft-peer"""
+    """Find pods started by us or at least running shardkv-peer/shardmaster-peer"""
     ret = v1.list_pod_for_all_namespaces(watch=False)
     def pod_filter(p):
         return p.metadata.namespace == "default" and \
                 len(p.spec.containers) == 1 and \
-                p.spec.containers[0].image == 'local/raft-peer'
+                (p.spec.containers[0].image == 'local/raftkv-peer' or p.spec.containers[0].image == 'local/shardmaster-peer')
     pods_we_own = filter(pod_filter, ret.items)
     return pods_we_own
 
@@ -43,7 +47,7 @@ def get_service(v1, service):
     """Get service spec for service"""
     return v1.list_service_for_all_namespaces(watch=False, field_selector="metadata.name=%s"%service)
 
-def boot_pod(v1, pod_spec, service_spec, name, peers):
+def boot_pod(v1, pod_spec, service_spec, name):
     """Boot a single pod"""
     pod_spec = copy.deepcopy(pod_spec)
     # Create a pod spec for this pod.
@@ -51,12 +55,6 @@ def boot_pod(v1, pod_spec, service_spec, name, peers):
     pod_spec['metadata']['labels']['app'] = name
     pod_spec['spec']['containers'][0]['ports'][0]['name']="%s-client"%name
     pod_spec['spec']['containers'][0]['ports'][1]['name']="%s-raft"%name
-    peers = filter(lambda p: p != name, peers)
-    args = ['server']
-    for peer in peers:
-        args.append('-peer')
-        args.append('%s:3001'%peer)
-    pod_spec['spec']['containers'][0]['command'] = args
 
     service_spec = copy.deepcopy(service_spec)
     # Create a service spec for this service
@@ -95,18 +93,30 @@ def boot(args):
     v1 = init()
     with open(os.path.join(sys.path[0], 'pod-template.yml')) as f:
         specs = list(yaml.load_all(f))
-        pod_spec = specs[0]
-        service_spec = specs[1]
+
+        """ launch shardkv groups """
+        shardkv_pod_spec = specs[0]
+        shardkv_service_spec = specs[1]
+        num_groups   = args.groups
         num_services = args.peers
-        peers = ['peer%d'%i for i in range(num_services)]
-        for peer in peers:
-            boot_pod(v1, pod_spec, service_spec, peer, peers)
+        for group_id in range(1, num_groups + 1):
+            for peer_id in range(num_services):
+                peer_name = "peer%d-%d" % (num_groups, num_services)
+                boot_pod(v1, shardkv_pod_spec, shardkv_service_spec, peer_name)
+
+        """ launch shardmaster group """
+        shardmaster_pod_spec = specs[2]
+        shardmaster_service_spec = specs[3]
+        num_services = args.peers
+        for peer_id in range(num_services):
+            peer_name = "peer0-%d" % (peer_id)
+            boot_pod(v1, shardmaster_pod_spec, shardmaster_service_spec, peer_name)
 
 def kill(args):
     """Kill selected peer"""
     v1 = init()
     pods = find_pods(v1)
-    peer = 'peer%d'%args.peer
+    peer = args.peer
     pod = list(filter(lambda i: i.metadata.name == peer, pods))
     if len(pod) != 1:
         sys.exit(1)
@@ -117,15 +127,21 @@ def launch(args):
     v1 = init()
     pods = find_pods(v1)
     peers = list(map(lambda i: i.metadata.name, pods))
-    pod = "peer%d"%args.peer
+    pod = args.peer
     if pod in peers:
         print("%d is already running"%args.peer, out=sys.stderr)
         sys.exit(1)
     with open(os.path.join(sys.path[0], 'pod-template.yml')) as f:
         specs = list(yaml.load_all(f))
-        pod_spec = specs[0]
-        service_spec = specs[1]
-        boot_pod(v1, pod_spec, service_spec, pod, peers)
+        group_id, _ = peer_name_to_group_peer(pod)
+        if group_id == "0" :
+            pod_spec = specs[2]
+            service_spec = specs[3]
+            boot_pod(v1, pod_spec, service_spec, pod)
+        else :
+            pod_spec = specs[0]
+            service_spec = specs[1]
+            boot_pod(v1, pod_spec, service_spec, pod)
 
 def get_service_url(args):
     """Get service URL for peer"""
@@ -136,16 +152,17 @@ def get_service_url(args):
     if len(svcs.items) != 1:
         print("Could not find service", file=sys.stderr)
         sys.exit(1)
-    svc = svcs.items[0]
-    ports = svc.spec.ports
-    with open(os.path.join(sys.path[0], 'pod-template.yml')) as f:
-        specs = list(yaml.load_all(f))
-        service_spec = specs[1]
-        for port in ports:
-            if port.port == service_spec['spec']['ports'][0]['port']:
-                print('%s:%d'%(ip, port.node_port))
-                sys.exit(0)
-    sys.exit(1)
+    print('%s:3000'%ip)
+    #svc = svcs.items[0]
+    #ports = svc.spec.ports
+    #with open(os.path.join(sys.path[0], 'pod-template.yml')) as f:
+    #    specs = list(yaml.load_all(f))
+    #    service_spec = specs[1]
+    #    for port in ports:
+    #        if port.port == service_spec['spec']['ports'][0]['port']:
+    #            print('%s:%d'%(ip, port.node_port))
+    #            sys.exit(0)
+    sys.exit(0)
 
 def main():
     parser = argparse.ArgumentParser(prog=sys.argv[0])
@@ -159,15 +176,16 @@ def main():
     list_parser.set_defaults(func = show)
 
     run_parser = subparsers.add_parser("boot")
-    run_parser.add_argument('peers', type=int, default=3, help='How many peers?')
+    run_parser.add_argument('groups', type=int, default=0, help='How many shardgroups? (excluding shardmaster')
+    run_parser.add_argument('peers', type=int, default=5, help='How many peers in each shardgroup?')
     run_parser.set_defaults(func = boot)
 
     kill_parser = subparsers.add_parser("kill")
-    kill_parser.add_argument('peer', type=int, help='Which peer should die')
+    kill_parser.add_argument('peer', type=str, help='Which peer should die')
     kill_parser.set_defaults(func=kill)
     
     kill_parser = subparsers.add_parser("launch")
-    kill_parser.add_argument('peer', type=int, help='Which peer should be launched')
+    kill_parser.add_argument('peer', type=str, help='Which peer should be launched')
     kill_parser.set_defaults(func=launch)
 
     svc_parser = subparsers.add_parser("client-url")

@@ -102,10 +102,9 @@ enum Op {
     GETRECONFIG = 7;
 
     // used for shardkv
-    GETKEY = 8;
-    DISABLEKEY = 9;
-    ENABLEKEY = 10;
-    UPDATECONFIG = 11;
+    DISABLEKEY = 8;
+    ENABLEKEY = 9;
+    UPDATECONFIG = 10;
 }
 
 
