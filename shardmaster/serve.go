@@ -291,7 +291,7 @@ func broadcastHeartbeat(raft *Raft, peerClients *map[string]pb.RaftClient,
 }
 
 // The main service loop. All modifications to the KV store are run through here.
-func serve(s *ShardMaster, r *rand.Rand, peers *arrayPeers, id string, port int) {
+func serve(s *ShardMaster, r *rand.Rand, peers *[]string, id string, port int) {
 	raft := Raft{
 		id: id,
 

@@ -83,7 +83,9 @@ func (s *ShardMaster) ReconfigInternal(k string, destGid int64) pb.Result {
 			Dst:      &pb.GroupId{Gid: destGid},
 			Key:      &pb.Key{Key: k},
 		}
+		log.Printf("Created a new reconfig entry: %v, %v, %v, %v", configId, srcGid, destGid, k)
 		s.Reconfigs = append(s.Reconfigs, reconfigItem)
+		s.KeyConfig[k] = destGid
 		return pb.Result{Result: &pb.Result_S{S: &pb.Success{}}}
 	}
 }

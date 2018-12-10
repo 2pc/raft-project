@@ -7,6 +7,7 @@ import (
 	rand "math/rand"
 	"net"
 	"os"
+	"strconv"
 	"time"
 
 	"google.golang.org/grpc"
@@ -14,11 +15,14 @@ import (
 	"github.com/nyu-distributed-systems-fa18/raft-extension/pb"
 )
 
+const (
+	NUM_PEER_IN_GROUP = 5
+)
+
 func main() {
 	// Argument parsing
 	var r *rand.Rand
 	var seed int64
-	var peers arrayPeers
 	var clientPort int
 	var raftPort int
 	flag.Int64Var(&seed, "seed", -1,
@@ -27,7 +31,6 @@ func main() {
 		"Port on which server should listen to client requests")
 	flag.IntVar(&raftPort, "raft", 3001,
 		"Port on which server should listen to Raft requests")
-	flag.Var(&peers, "peer", "A peer for this process")
 	flag.Parse()
 
 	// Initialize the random number generator
@@ -57,6 +60,14 @@ func main() {
 	}
 	// Create a new GRPC server
 	s := grpc.NewServer()
+
+	peers := make([]string, 0)
+	for i := 0; i < NUM_PEER_IN_GROUP; i++ {
+		peerString := "peer0-" + strconv.Itoa(i) + ":3001"
+		if id != peerString {
+			peers = append(peers, peerString)
+		}
+	}
 
 	// Initialize KVStore
 	store := ShardMaster{C: make(chan InputChannelType), KeyConfig: make(map[string]int64), Reconfigs: make([]*pb.Reconfig, 0)}

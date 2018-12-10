@@ -152,16 +152,15 @@ def get_service_url(args):
     if len(svcs.items) != 1:
         print("Could not find service", file=sys.stderr)
         sys.exit(1)
-    print('%s:3000'%ip)
-    #svc = svcs.items[0]
-    #ports = svc.spec.ports
-    #with open(os.path.join(sys.path[0], 'pod-template.yml')) as f:
-    #    specs = list(yaml.load_all(f))
-    #    service_spec = specs[1]
-    #    for port in ports:
-    #        if port.port == service_spec['spec']['ports'][0]['port']:
-    #            print('%s:%d'%(ip, port.node_port))
-    #            sys.exit(0)
+    svc = svcs.items[0]
+    ports = svc.spec.ports
+    with open(os.path.join(sys.path[0], 'pod-template.yml')) as f:
+        specs = list(yaml.load_all(f))
+        service_spec = specs[1]
+        for port in ports:
+            if port.port == service_spec['spec']['ports'][0]['port']:
+                print('%s:%d'%(ip, port.node_port))
+                sys.exit(0)
     sys.exit(0)
 
 def main():

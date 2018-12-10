@@ -7,9 +7,9 @@ import (
 	"os"
 	"os/exec"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
-	// "strconv"
 
 	context "golang.org/x/net/context"
 	"google.golang.org/grpc"
@@ -303,12 +303,97 @@ func dummytest(peer string) {
 	}
 }
 
+func smGetConfig(peer string, key string) {
+	log.Printf("Connecting to %v", peer)
+	// Connect to the server. We use WithInsecure since we do not configure https in this class.
+	endpoint, err := getKVServiceURL(peer)
+	if err != nil {
+		log.Fatalf("Failed to dial GRPC server %v", err)
+	}
+	conn, err := connToEndpoint(endpoint)
+	//Ensure connection did not fail.
+	if err != nil {
+		log.Fatalf("Failed to dial GRPC server %v", err)
+	}
+	log.Printf("Connected")
+
+	smc := pb.NewShardMasterClient(conn)
+
+	res, err := smc.GetKeyGroup(context.Background(), &pb.Key{Key: key})
+	if err != nil {
+		log.Printf("%v", err)
+		log.Fatalf("Could not get")
+	}
+	if redirect := res.GetRedirect(); redirect != nil {
+		log.Printf("Got redirect response: %v", redirect.Server)
+		return
+	}
+	log.Printf("Got response value:%v", res.GetGid().Gid)
+}
+
+func smSetConfig(peer string, key string, dstGid int64) {
+	log.Printf("Connecting to %v", peer)
+	// Connect to the server. We use WithInsecure since we do not configure https in this class.
+	endpoint, err := getKVServiceURL(peer)
+	if err != nil {
+		log.Fatalf("Failed to dial GRPC server %v", err)
+	}
+	conn, err := connToEndpoint(endpoint)
+	//Ensure connection did not fail.
+	if err != nil {
+		log.Fatalf("Failed to dial GRPC server %v", err)
+	}
+	log.Printf("Connected")
+
+	smc := pb.NewShardMasterClient(conn)
+
+	smSetReq := &pb.ReconfigArgs{Key: &pb.Key{Key: key}, DestGid: &pb.GroupId{Gid: dstGid}}
+	res, err := smc.Reconfig(context.Background(), smSetReq)
+	if err != nil {
+		log.Fatalf("Could not get")
+	}
+	if redirect := res.GetRedirect(); redirect != nil {
+		log.Printf("Got redirect response: %v", redirect.Server)
+		return
+	}
+	log.Printf("Set complete")
+}
+
+func smGetReconfig(peer string, configId int64) {
+	log.Printf("Connecting to %v", peer)
+	endpoint, err := getKVServiceURL(peer)
+	if err != nil {
+		log.Fatalf("Failed to dial GRPC server %v", err)
+	}
+	conn, err := connToEndpoint(endpoint)
+	//Ensure connection did not fail.
+	if err != nil {
+		log.Fatalf("Failed to dial GRPC server %v", err)
+	}
+	log.Printf("Connected")
+
+	smc := pb.NewShardMasterClient(conn)
+
+	smGetReconfigReq := &pb.ConfigId{ConfigId: configId}
+	res, err := smc.GetReconfig(context.Background(), smGetReconfigReq)
+	if err != nil {
+		log.Fatalf("Could not get")
+	}
+	if redirect := res.GetRedirect(); redirect != nil {
+		log.Printf("Got redirect response: %v", redirect.Server)
+		return
+	}
+	reconfig := res.GetReconfig()
+	log.Printf("Got response configId:%v, src group:%v, dst group:%v, key: %v",
+		reconfig.ConfigId.ConfigId, reconfig.Src.Gid, reconfig.Dst.Gid, reconfig.Key.Key)
+}
+
 func main() {
 	// Take endpoint as input
 	flag.Usage = usage
 	flag.Parse()
 	// If there is no option fail
-	if flag.NArg() != 2 {
+	if flag.NArg() <= 2 {
 		flag.Usage()
 		os.Exit(1)
 	}
@@ -326,6 +411,26 @@ func main() {
 	case "leave":
 		peer := flag.Args()[1]
 		sendLeave(peer, listAvailRaftServer())
+	case "sm":
+		command := flag.Args()[1]
+		switch command {
+		case "getconfig":
+			peer := flag.Args()[2]
+			key := flag.Args()[3]
+			smGetConfig(peer, key)
+		case "setconfig":
+			peer := flag.Args()[2]
+			key := flag.Args()[3]
+			parseInt, _ := strconv.Atoi(flag.Args()[4])
+			dstGroup := int64(parseInt)
+			smSetConfig(peer, key, dstGroup)
+		case "getreconfig":
+			peer := flag.Args()[2]
+			parseInt, _ := strconv.Atoi(flag.Args()[3])
+			configId := int64(parseInt)
+			smGetReconfig(peer, configId)
+		}
+
 	default:
 		flag.Usage()
 		os.Exit(1)
