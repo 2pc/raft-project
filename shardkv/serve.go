@@ -1073,8 +1073,21 @@ func serve(s *ShardKv, r *rand.Rand, peers *[]string, services map[int64]([]stri
 				// I'm the reciver, I should get the key I need...
 				if srcGid == 0 {
 					// this key came from invalid, we simply need to enable it
-					s.valid[key] = true
-					s.currConfig = configId
+					// now put a "ENABLE KEY" command into our log
+					cmd := pb.Command{
+						Operation: pb.Op_ENABLEKEY,
+						Arg: &pb.Command_KeyMigrate{KeyMigrate: &pb.KeyMigrateArgs{
+							Reconfig: reconfig,
+							Value:    &pb.Value{Value: ""},
+						}}}
+					newEntry := pb.Entry{
+						Term:  raft.currentTerm,
+						Index: raft.lastLogIndex + 1,
+						Cmd:   &cmd,
+					}
+					raft.log = append(raft.log, &newEntry)
+					raft.lastLogIndex++
+					raft.lastLogTerm = raft.currentTerm
 				} else {
 					migrateKey(reconfig, &raft, services[srcGid], &migrateKeyResponseChan)
 				}
