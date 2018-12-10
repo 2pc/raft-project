@@ -69,6 +69,11 @@ type GetReconfigResponse struct {
 	ret *pb.Reconfig
 }
 
+type MigrateKeyResponse struct {
+	arg *pb.Reconfig
+	ret *pb.KeyValue
+}
+
 // Struct off of which we shall hang the Raft service
 type Raft struct {
 	id string
@@ -343,6 +348,40 @@ func queryReconfig(s *ShardKv, raft *Raft, smPeers []string, getReconfigResponse
 	}
 }
 
+func connectToShardKv(peer string) (pb.ShardKvClient, error) {
+	conn, err := grpc.Dial(peer, grpc.WithInsecure(), grpc.WithTimeout(SERVICE_TIMEOUT*time.Millisecond))
+	// Ensure connection did not fail, which should not happen since this happens in the background
+	if err != nil {
+		return pb.NewShardKvClient(nil), err
+	}
+	return pb.NewShardKvClient(conn), nil
+}
+
+func migrateKey(reconfig *pb.Reconfig, raft *Raft, shardKvPeers []string, migrateKeyResponseChan *chan MigrateKeyResponse) {
+	// similarly, we broadcase to all the servers to the target group, and only one (or none) should succeed
+	for _, p := range shardKvPeers {
+		args := reconfig
+		go func(p string, args *pb.Reconfig) {
+			c, err := connectToShardKv(p)
+			if err != nil {
+				return
+			}
+			ret, err := c.KeyMigration(context.Background(), args)
+			if err != nil {
+				return
+			}
+			keyValue := ret.GetKv()
+			if keyValue == nil {
+				// this means that we received an redirect, or the target server is not ready to send it
+				return
+			}
+
+			// here we use this channel to solve the concurrency
+			*migrateKeyResponseChan <- MigrateKeyResponse{arg: args, ret: keyValue}
+		}(p, args)
+	}
+}
+
 // The main service loop. All modifications to the KV store are run through here.
 func serve(s *ShardKv, r *rand.Rand, peers *[]string, services map[int64]([]string), id string, groupId int64, port int) {
 	raft := Raft{
@@ -402,6 +441,7 @@ func serve(s *ShardKv, r *rand.Rand, peers *[]string, services map[int64]([]stri
 	voteResponseChan := make(chan VoteResponse)
 	installSnapshotResponseChan := make(chan InstallShapshotResponse)
 	getReconfigResponseChan := make(chan GetReconfigResponse)
+	migrateKeyResponseChan := make(chan MigrateKeyResponse)
 
 	// Create the timers and start running it
 	electionTimer := time.NewTimer(randomDuration(r))
@@ -1031,7 +1071,7 @@ func serve(s *ShardKv, r *rand.Rand, peers *[]string, services map[int64]([]stri
 				raft.lastLogTerm = raft.currentTerm
 			} else if dstGid == raft.groupId {
 				// I'm the reciver, I should get the key I need...
-				// TODO
+				migrateKey(reconfig, &raft, services[srcGid], &migrateKeyResponseChan)
 			} else {
 				// Not my bussiness, but I need to update our config num
 				cmd := pb.Command{
@@ -1049,6 +1089,38 @@ func serve(s *ShardKv, r *rand.Rand, peers *[]string, services map[int64]([]stri
 				raft.lastLogIndex++
 				raft.lastLogTerm = raft.currentTerm
 			}
+		case mr := <-migrateKeyResponseChan:
+			reconfig := mr.arg
+			configId := reconfig.ConfigId.ConfigId
+			srcGid := reconfig.Src.Gid
+			key := reconfig.Key.Key
+
+			keyValue := mr.ret
+			value := keyValue.Value
+			if key != keyValue.Key {
+				log.Fatalf("Key mismatch on migration, got %v but %v expected", keyValue.Key, key)
+			}
+			log.Printf("Got response from key migration: configId:%v, src group:%v, key: %v, value: %v",
+				configId, srcGid, key, value)
+			if configId != s.currConfig+1 {
+				log.Printf("Our next config id should be %v, but got %v, ignore", s.currConfig+1, configId)
+				break
+			}
+			// now put a "ENABLE KEY" command into our log
+			cmd := pb.Command{
+				Operation: pb.Op_ENABLEKEY,
+				Arg: &pb.Command_KeyMigrate{KeyMigrate: &pb.KeyMigrateArgs{
+					Reconfig: reconfig,
+					Value:    &pb.Value{Value: value},
+				}}}
+			newEntry := pb.Entry{
+				Term:  raft.currentTerm,
+				Index: raft.lastLogIndex + 1,
+				Cmd:   &cmd,
+			}
+			raft.log = append(raft.log, &newEntry)
+			raft.lastLogIndex++
+			raft.lastLogTerm = raft.currentTerm
 		}
 	}
 	log.Printf("Strange to arrive here")
