@@ -76,10 +76,14 @@ message Peer {
     string peer = 1;
 }
 
-
 message ReconfigArgs {
     Key key = 1;
     GroupId destGid = 2;
+}
+
+message KeyMigrateArgs {
+    Reconfig reconfig = 1;
+    Value value = 2; 
 }
 
 // ---------------------------------------------------------------------------
@@ -102,9 +106,15 @@ enum Op {
     GETRECONFIG = 7;
 
     // used for shardkv
+    // sender 
     DISABLEKEY = 8;
-    ENABLEKEY = 9;
-    UPDATECONFIG = 10;
+    SENDKEY = 9;
+
+    // receiver
+    ENABLEKEY = 10;
+
+    // nether
+    UPDATECONFIG = 11;
 }
 
 
@@ -123,6 +133,7 @@ message Command {
         ConfigId retriveReconfig = 8;
 
         // used for shardkv
+        KeyMigrateArgs keyMigrate = 9;
     }
 }
 
@@ -130,7 +141,6 @@ message Command {
 
 // KvStore service
 service KvStore {
-    // Get the value associated with a key.
     rpc Get (Key) returns (Result) {}
     rpc Set (KeyValue) returns (Result) {}
     rpc Clear(Empty) returns (Result) {}
@@ -206,4 +216,14 @@ service ShardMaster {
     rpc GetKeyGroup(Key) returns (Result) {}
     rpc Reconfig(ReconfigArgs) returns (Result) {}
     rpc GetReconfig(ConfigId) returns (Result) {}
+}
+
+service ShardKv {
+    rpc Get (Key) returns (Result) {}
+    rpc Set (KeyValue) returns (Result) {}
+    rpc Clear(Empty) returns (Result) {}
+    rpc CAS(CASArg) returns (Result) {}
+    rpc PeerJoin (Peer) returns (Result) {}
+    rpc PeerLeave (Peer) returns (Result) {}
+    rpc KeyMigration (Reconfig) returns (Result) {}
 }

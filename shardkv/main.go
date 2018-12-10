@@ -7,6 +7,8 @@ import (
 	rand "math/rand"
 	"net"
 	"os"
+	"strconv"
+	"strings"
 	"time"
 
 	"google.golang.org/grpc"
@@ -14,11 +16,22 @@ import (
 	"github.com/nyu-distributed-systems-fa18/raft-extension/pb"
 )
 
+const (
+	NUM_PEER_IN_GROUP    = 5
+	NUM_GROUP_IN_CLUSTER = 3
+)
+
+func peer_name_split(peer string) (int, int) {
+	tmp := strings.Split("-", peer)
+	group_id, _ := strconv.Atoi(tmp[1])
+	peer_id, _ := strconv.Atoi(tmp[2])
+	return group_id, peer_id
+}
+
 func main() {
 	// Argument parsing
 	var r *rand.Rand
 	var seed int64
-	var peers arrayPeers
 	var clientPort int
 	var raftPort int
 	flag.Int64Var(&seed, "seed", -1,
@@ -27,7 +40,6 @@ func main() {
 		"Port on which server should listen to client requests")
 	flag.IntVar(&raftPort, "raft", 3001,
 		"Port on which server should listen to Raft requests")
-	flag.Var(&peers, "peer", "A peer for this process")
 	flag.Parse()
 
 	// Initialize the random number generator
@@ -58,13 +70,40 @@ func main() {
 	// Create a new GRPC server
 	s := grpc.NewServer()
 
+	// construct the peers in my group
+	group_id, _ := peer_name_split(name)
+	peers := make([]string, 0)
+	for i := 0; i < NUM_PEER_IN_GROUP; i++ {
+		peerString := fmt.Sprintf("peer%d-%d:%d", group_id, i, raftPort)
+		if id != peerString {
+			peers = append(peers, peerString)
+		}
+	}
+
+	// construct the peers in shardmaster/other groups
+	services := make(map[int64]([]string))
+	for i := 0; i < NUM_GROUP_IN_CLUSTER; i++ {
+		if i != group_id {
+			services[int64(i)] = make([]string, 0)
+			for j := 0; j < NUM_PEER_IN_GROUP; j++ {
+				peerString := fmt.Sprintf("peer%d-%d:%d", i, j, clientPort)
+				services[int64(i)] = append(services[int64(i)], peerString)
+			}
+		}
+	}
+
 	// Initialize KVStore
-	store := KVStore{C: make(chan InputChannelType), store: make(map[string]string)}
-	go serve(&store, r, &peers, id, raftPort)
+	store := ShardKv{
+		C:          make(chan InputChannelType),
+		store:      make(map[string]string),
+		valid:      make(map[string]bool),
+		currConfig: int64(-1),
+	}
+	go serve(&store, r, &peers, services, id, int64(group_id), raftPort)
 
 	// Tell GRPC that s will be serving requests for the KvStore service and should use store (defined on line 23)
 	// as the struct whose methods should be called in response.
-	pb.RegisterKvStoreServer(s, &store)
+	pb.RegisterShardKvServer(s, &store)
 	log.Printf("Going to listen on port %v", clientPort)
 	// Start serving, this will block this function and only return when done.
 	if err := s.Serve(c); err != nil {

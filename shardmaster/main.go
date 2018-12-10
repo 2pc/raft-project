@@ -63,7 +63,7 @@ func main() {
 
 	peers := make([]string, 0)
 	for i := 0; i < NUM_PEER_IN_GROUP; i++ {
-		peerString := "peer0-" + strconv.Itoa(i) + ":3001"
+		peerString := fmt.Sprintf("peer0-%d:%d", i, raftPort)
 		if id != peerString {
 			peers = append(peers, peerString)
 		}

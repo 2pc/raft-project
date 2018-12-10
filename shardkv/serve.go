@@ -18,10 +18,12 @@ import (
 )
 
 const (
-	LOG_LIMIT                    = 5
+	LOG_LIMIT                    = 30
 	ELECTION_TIMEOUT_UPPER_BOUND = 20000
 	ELECTION_TIMEOUT_LOWER_BOUND = 5000
 	HEARTBEAT_TIMEOUT            = 1000
+	RECONFIG_TIMEOUT             = 3000
+	SERVICE_TIMEOUT              = 3000
 )
 
 // Messages that can be passed from the Raft RPC server to the main loop for AppendEntries
@@ -62,6 +64,11 @@ type InstallShapshotResponse struct {
 	peer string
 }
 
+type GetReconfigResponse struct {
+	arg *pb.ConfigId
+	ret *pb.Reconfig
+}
+
 // Struct off of which we shall hang the Raft service
 type Raft struct {
 	id string
@@ -89,6 +96,7 @@ type Raft struct {
 	// ---------------------- valatile on each server -------------------------------------
 	commitIndex int64
 	lastApplied int64
+	groupId     int64
 
 	// snapshot related
 	snapshotServiceData []byte
@@ -179,6 +187,17 @@ func restartHeartbeatTimer(timer *time.Timer) {
 	timer.Reset(time.Duration(HEARTBEAT_TIMEOUT * time.Millisecond))
 }
 
+func restartReconfigTimer(timer *time.Timer) {
+	stopped := timer.Stop()
+	if !stopped {
+		// Loop for any queued notifications
+		for len(timer.C) > 0 {
+			<-timer.C
+		}
+	}
+	timer.Reset(time.Duration(RECONFIG_TIMEOUT * time.Millisecond))
+}
+
 // Launch a GRPC service for this Raft peer.
 func RunRaftServer(r *Raft, port int) {
 	// Convert port to a string form
@@ -213,7 +232,7 @@ func connectToPeer(peer string) (pb.RaftClient, error) {
 	return pb.NewRaftClient(conn), nil
 }
 
-func createSnapShot(r *Raft, s *KVStore) {
+func createSnapShot(r *Raft, s *ShardKv) {
 	// pull out all data, we don't have a disk, thus we just store them in memory
 	r.snapshotServiceData = s.CreateSnapshot()
 	r.lastIncludedIndex = r.lastApplied
@@ -290,8 +309,42 @@ func broadcastHeartbeat(raft *Raft, peerClients *map[string]pb.RaftClient,
 	}
 }
 
+func connectToShardMaster(peer string) (pb.ShardMasterClient, error) {
+	conn, err := grpc.Dial(peer, grpc.WithInsecure(), grpc.WithTimeout(SERVICE_TIMEOUT*time.Millisecond))
+	// Ensure connection did not fail, which should not happen since this happens in the background
+	if err != nil {
+		return pb.NewShardMasterClient(nil), err
+	}
+	return pb.NewShardMasterClient(conn), nil
+}
+
+func queryReconfig(s *ShardKv, raft *Raft, smPeers []string, getReconfigResponseChan *chan GetReconfigResponse) {
+	// here we broadcase to all the shard masters, and only one (or none) should succeed
+	for _, p := range smPeers {
+		args := &pb.ConfigId{ConfigId: s.currConfig + 1}
+		go func(p string, args *pb.ConfigId) {
+			c, err := connectToShardMaster(p)
+			if err != nil {
+				return
+			}
+			ret, err := c.GetReconfig(context.Background(), args)
+			if err != nil {
+				return
+			}
+			reconfig := ret.GetReconfig()
+			if reconfig == nil {
+				// this means that we received an redirect, or our configuration is up-to-date
+				return
+			}
+
+			// here we use this channel to solve the concurrency
+			*getReconfigResponseChan <- GetReconfigResponse{arg: args, ret: reconfig}
+		}(p, args)
+	}
+}
+
 // The main service loop. All modifications to the KV store are run through here.
-func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int) {
+func serve(s *ShardKv, r *rand.Rand, peers *[]string, services map[int64]([]string), id string, groupId int64, port int) {
 	raft := Raft{
 		id: id,
 
@@ -315,6 +368,7 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int) {
 
 		commitIndex: -1,
 		lastApplied: -1,
+		groupId:     groupId,
 
 		snapshotServiceData: make([]byte, 0),
 		snapshotRaftData:    make([]byte, 0),
@@ -347,14 +401,22 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int) {
 	appendResponseChan := make(chan AppendResponse)
 	voteResponseChan := make(chan VoteResponse)
 	installSnapshotResponseChan := make(chan InstallShapshotResponse)
+	getReconfigResponseChan := make(chan GetReconfigResponse)
 
 	// Create the timers and start running it
 	electionTimer := time.NewTimer(randomDuration(r))
 	heartbeatTimer := time.NewTimer(HEARTBEAT_TIMEOUT * time.Millisecond)
+	reconfigTimer := time.NewTimer(RECONFIG_TIMEOUT * time.Millisecond)
 
 	// Run forever handling inputs from various channels
 	for {
 		select {
+		case <-reconfigTimer.C:
+			if raft.state == 2 {
+				log.Printf("Leader now query the ShardMaster about new configurations")
+				queryReconfig(s, &raft, services[0], &getReconfigResponseChan)
+			}
+			restartReconfigTimer(reconfigTimer)
 		case <-electionTimer.C:
 			// The election timer went off.
 			if raft.state == 0 || raft.state == 1 {
@@ -938,6 +1000,55 @@ func serve(s *KVStore, r *rand.Rand, peers *arrayPeers, id string, port int) {
 			// update the information for this peer
 			raft.matchIndex[sr.peer] = sr.arg.LastIncludedIndex
 			raft.nextIndex[sr.peer] = raft.matchIndex[sr.peer] + 1
+
+		case rr := <-getReconfigResponseChan:
+			reconfig := rr.ret
+			configId := reconfig.ConfigId.ConfigId
+			srcGid := reconfig.Src.Gid
+			dstGid := reconfig.Dst.Gid
+			key := reconfig.Key.Key
+			log.Printf("Got response configId:%v, src group:%v, dst group:%v, key: %v",
+				configId, srcGid, dstGid, key)
+			if configId != s.currConfig+1 {
+				log.Printf("Our next config id should be %v, but got %v, ignore", s.currConfig+1, configId)
+				break
+			}
+			if srcGid == raft.groupId {
+				// I'm the sender, I should not serve this key anymore
+				cmd := pb.Command{
+					Operation: pb.Op_DISABLEKEY,
+					Arg: &pb.Command_KeyMigrate{KeyMigrate: &pb.KeyMigrateArgs{
+						Reconfig: reconfig,
+						Value:    &pb.Value{Value: ""}, // the value is unused in this case
+					}}}
+				newEntry := pb.Entry{
+					Term:  raft.currentTerm,
+					Index: raft.lastLogIndex + 1,
+					Cmd:   &cmd,
+				}
+				raft.log = append(raft.log, &newEntry)
+				raft.lastLogIndex++
+				raft.lastLogTerm = raft.currentTerm
+			} else if dstGid == raft.groupId {
+				// I'm the reciver, I should get the key I need...
+				// TODO
+			} else {
+				// Not my bussiness, but I need to update our config num
+				cmd := pb.Command{
+					Operation: pb.Op_UPDATECONFIG,
+					Arg: &pb.Command_KeyMigrate{KeyMigrate: &pb.KeyMigrateArgs{
+						Reconfig: reconfig,
+						Value:    &pb.Value{Value: ""}, // the value is unused in this case
+					}}}
+				newEntry := pb.Entry{
+					Term:  raft.currentTerm,
+					Index: raft.lastLogIndex + 1,
+					Cmd:   &cmd,
+				}
+				raft.log = append(raft.log, &newEntry)
+				raft.lastLogIndex++
+				raft.lastLogTerm = raft.currentTerm
+			}
 		}
 	}
 	log.Printf("Strange to arrive here")
