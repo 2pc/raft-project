@@ -18,7 +18,7 @@ def find_pods(v1):
     def pod_filter(p):
         return p.metadata.namespace == "default" and \
                 len(p.spec.containers) == 1 and \
-                (p.spec.containers[0].image == 'local/raftkv-peer' or p.spec.containers[0].image == 'local/shardmaster-peer')
+                (p.spec.containers[0].image == 'local/shardkv-peer' or p.spec.containers[0].image == 'local/shardmaster-peer')
     pods_we_own = filter(pod_filter, ret.items)
     return pods_we_own
 
@@ -101,7 +101,7 @@ def boot(args):
         num_services = args.peers
         for group_id in range(1, num_groups + 1):
             for peer_id in range(num_services):
-                peer_name = "peer%d-%d" % (num_groups, num_services)
+                peer_name = "peer%d-%d" % (group_id, peer_id)
                 boot_pod(v1, shardkv_pod_spec, shardkv_service_spec, peer_name)
 
         """ launch shardmaster group """

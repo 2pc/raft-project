@@ -1071,7 +1071,13 @@ func serve(s *ShardKv, r *rand.Rand, peers *[]string, services map[int64]([]stri
 				raft.lastLogTerm = raft.currentTerm
 			} else if dstGid == raft.groupId {
 				// I'm the reciver, I should get the key I need...
-				migrateKey(reconfig, &raft, services[srcGid], &migrateKeyResponseChan)
+				if srcGid == 0 {
+					// this key came from invalid, we simply need to enable it
+					s.valid[key] = true
+					s.currConfig = configId
+				} else {
+					migrateKey(reconfig, &raft, services[srcGid], &migrateKeyResponseChan)
+				}
 			} else {
 				// Not my bussiness, but I need to update our config num
 				cmd := pb.Command{

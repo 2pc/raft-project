@@ -18,7 +18,7 @@ import (
 )
 
 const (
-	LOG_LIMIT                    = 5
+	LOG_LIMIT                    = 30
 	ELECTION_TIMEOUT_UPPER_BOUND = 20000
 	ELECTION_TIMEOUT_LOWER_BOUND = 5000
 	HEARTBEAT_TIMEOUT            = 1000

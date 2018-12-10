@@ -18,13 +18,13 @@ import (
 
 const (
 	NUM_PEER_IN_GROUP    = 5
-	NUM_GROUP_IN_CLUSTER = 3
+	NUM_GROUP_IN_CLUSTER = 1
 )
 
 func peer_name_split(peer string) (int, int) {
-	tmp := strings.Split("-", peer)
-	group_id, _ := strconv.Atoi(tmp[1])
-	peer_id, _ := strconv.Atoi(tmp[2])
+	tmp := strings.Split(peer, "-")
+	group_id, _ := strconv.Atoi(tmp[0][4:])
+	peer_id, _ := strconv.Atoi(tmp[1])
 	return group_id, peer_id
 }
 
