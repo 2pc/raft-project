@@ -1049,6 +1049,10 @@ func serve(s *ShardKv, r *rand.Rand, peers *[]string, services map[int64]([]stri
 			key := reconfig.Key.Key
 			log.Printf("Got response configId:%v, src group:%v, dst group:%v, key: %v",
 				configId, srcGid, dstGid, key)
+			if raft.state != 2 {
+				log.Printf("Not leader anymore, ignore")
+				break
+			}
 			if configId != s.currConfig+1 {
 				log.Printf("Our next config id should be %v, but got %v, ignore", s.currConfig+1, configId)
 				break
@@ -1113,7 +1117,10 @@ func serve(s *ShardKv, r *rand.Rand, peers *[]string, services map[int64]([]stri
 			configId := reconfig.ConfigId.ConfigId
 			srcGid := reconfig.Src.Gid
 			key := reconfig.Key.Key
-
+			if raft.state != 2 {
+				log.Printf("Not leader anymore, ignore")
+				break
+			}
 			keyValue := mr.ret
 			value := keyValue.Value
 			if key != keyValue.Key {

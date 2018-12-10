@@ -116,6 +116,10 @@ func (s *ShardKv) KeyMigration(ctx context.Context, in *pb.Reconfig) (*pb.Result
 // execution, and hence does not handle races.
 func (s *ShardKv) GetInternal(k string) pb.Result {
 	log.Printf("Executing GetInternal, with key: %v", k)
+	if !s.valid[k] {
+		log.Printf("Currently not responsible for key %v", k)
+		return pb.Result{Result: &pb.Result_NotResponsible{NotResponsible: &pb.NotResponsible{}}}
+	}
 	v := s.store[k]
 	return pb.Result{Result: &pb.Result_Kv{Kv: &pb.KeyValue{Key: k, Value: v}}}
 }
@@ -124,6 +128,10 @@ func (s *ShardKv) GetInternal(k string) pb.Result {
 // thread of execution and hence does not handle race conditions.
 func (s *ShardKv) SetInternal(k string, v string) pb.Result {
 	log.Printf("Executing SetInternal, with key: %v, value: %v", k, v)
+	if !s.valid[k] {
+		log.Printf("Currently not responsible for key %v", k)
+		return pb.Result{Result: &pb.Result_NotResponsible{NotResponsible: &pb.NotResponsible{}}}
+	}
 	s.store[k] = v
 	return pb.Result{Result: &pb.Result_Kv{Kv: &pb.KeyValue{Key: k, Value: v}}}
 }
@@ -138,6 +146,10 @@ func (s *ShardKv) ClearInternal() pb.Result {
 // Used internally this function performs CAS assuming no races.
 func (s *ShardKv) CasInternal(k string, v string, vn string) pb.Result {
 	log.Printf("Executing CasInternal, with key: %v, value: %v, v_new: %v", k, v, vn)
+	if !s.valid[k] {
+		log.Printf("Currently not responsible for key %v", k)
+		return pb.Result{Result: &pb.Result_NotResponsible{NotResponsible: &pb.NotResponsible{}}}
+	}
 	vc := s.store[k]
 	if vc == v {
 		s.store[k] = vn

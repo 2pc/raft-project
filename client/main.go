@@ -17,8 +17,13 @@ import (
 	"github.com/nyu-distributed-systems-fa18/raft-extension/pb"
 )
 
+const (
+	NUM_PEER_IN_GROUP    = 5
+	NUM_GROUP_IN_CLUSTER = 3
+)
+
 func usage() {
-	fmt.Printf("Usage %s <dummytest/test/multitest/join/leave>\n", os.Args[0])
+	fmt.Printf("Usage %s <sm/sg> <command> <args>\n", os.Args[0])
 	flag.PrintDefaults()
 }
 
@@ -89,7 +94,7 @@ func getKvcAtRedirect(peer string, allServer []string, serverIndex *int) pb.KvSt
 	return kvc
 }
 
-func single_checker(key string, allServer []string) {
+func sg_single_checker(key string, allServer []string) {
 	serverIndex := 0
 	kvc := getKvcAtNextIndex(allServer, &serverIndex)
 	flag := false
@@ -180,49 +185,7 @@ func single_checker(key string, allServer []string) {
 	}
 }
 
-func sendJoin(peer string, allServer []string) {
-	serverIndex := 0
-	kvc := getKvcAtNextIndex(allServer, &serverIndex)
-	flag := true
-	for flag {
-		joinReq := &pb.Peer{Peer: peer}
-		res, err := kvc.PeerJoin(context.Background(), joinReq)
-		if err != nil {
-			kvc = getKvcAtNextIndex(allServer, &serverIndex)
-			continue
-		}
-		if redirect := res.GetRedirect(); redirect != nil {
-			log.Printf("Got redirect response: %v", redirect.Server)
-			kvc = getKvcAtRedirect(redirect.Server, allServer, &serverIndex)
-			continue
-		}
-		log.Printf("Join finish")
-		flag = false
-	}
-}
-
-func sendLeave(peer string, allServer []string) {
-	serverIndex := 0
-	kvc := getKvcAtNextIndex(allServer, &serverIndex)
-	flag := true
-	for flag {
-		leaveReq := &pb.Peer{Peer: peer}
-		res, err := kvc.PeerLeave(context.Background(), leaveReq)
-		if err != nil {
-			kvc = getKvcAtNextIndex(allServer, &serverIndex)
-			continue
-		}
-		if redirect := res.GetRedirect(); redirect != nil {
-			log.Printf("Got redirect response: %v", redirect.Server)
-			kvc = getKvcAtRedirect(redirect.Server, allServer, &serverIndex)
-			continue
-		}
-		log.Printf("Leave Finish")
-		flag = false
-	}
-}
-
-func dummytest(peer string) {
+func sg_dummytest(peer string) {
 	log.Printf("Connecting to %v", peer)
 	// Connect to the server. We use WithInsecure since we do not configure https in this class.
 	endpoint, err := getKVServiceURL(peer)
@@ -236,7 +199,7 @@ func dummytest(peer string) {
 	}
 	log.Printf("Connected")
 	// Create a KvStore client
-	kvc := pb.NewKvStoreClient(conn)
+	kvc := pb.NewShardKvClient(conn)
 	// Clear KVC
 	res, err := kvc.Clear(context.Background(), &pb.Empty{})
 	if err != nil {
@@ -253,6 +216,10 @@ func dummytest(peer string) {
 	if err != nil {
 		log.Fatalf("Put error")
 	}
+	if nr := res.GetNotResponsible(); nr != nil {
+		log.Printf("Got not responsible")
+		return
+	}
 	log.Printf("Got response key: \"%v\" value:\"%v\"", res.GetKv().Key, res.GetKv().Value)
 	if res.GetKv().Key != "hello" || res.GetKv().Value != "1" {
 		log.Fatalf("Put returned the wrong response")
@@ -263,6 +230,10 @@ func dummytest(peer string) {
 	res, err = kvc.Get(context.Background(), req)
 	if err != nil {
 		log.Fatalf("Request error %v", err)
+	}
+	if nr := res.GetNotResponsible(); nr != nil {
+		log.Printf("Got not responsible")
+		return
 	}
 	log.Printf("Got response key: \"%v\" value:\"%v\"", res.GetKv().Key, res.GetKv().Value)
 	if res.GetKv().Key != "hello" || res.GetKv().Value != "1" {
@@ -275,6 +246,10 @@ func dummytest(peer string) {
 	if err != nil {
 		log.Fatalf("Request error %v", err)
 	}
+	if nr := res.GetNotResponsible(); nr != nil {
+		log.Printf("Got not responsible")
+		return
+	}
 	log.Printf("Got response key: \"%v\" value:\"%v\"", res.GetKv().Key, res.GetKv().Value)
 	if res.GetKv().Key != "hello" || res.GetKv().Value != "2" {
 		log.Fatalf("Get returned the wrong response")
@@ -286,6 +261,10 @@ func dummytest(peer string) {
 	if err != nil {
 		log.Fatalf("Request error %v", err)
 	}
+	if nr := res.GetNotResponsible(); nr != nil {
+		log.Printf("Got not responsible")
+		return
+	}
 	log.Printf("Got response key: \"%v\" value:\"%v\"", res.GetKv().Key, res.GetKv().Value)
 	if res.GetKv().Key != "hello" || res.GetKv().Value == "3" {
 		log.Fatalf("Get returned the wrong response")
@@ -296,6 +275,10 @@ func dummytest(peer string) {
 	res, err = kvc.CAS(context.Background(), casReq)
 	if err != nil {
 		log.Fatalf("Request error %v", err)
+	}
+	if nr := res.GetNotResponsible(); nr != nil {
+		log.Printf("Got not responsible")
+		return
 	}
 	log.Printf("Got response key: \"%v\" value:\"%v\"", res.GetKv().Key, res.GetKv().Value)
 	if res.GetKv().Key != "hellooo" || res.GetKv().Value == "2" {
@@ -399,18 +382,6 @@ func main() {
 	}
 	optype := flag.Args()[0]
 	switch optype {
-	case "dummytest":
-		endpoint := flag.Args()[1]
-		dummytest(endpoint)
-	case "test":
-		key := flag.Args()[1]
-		single_checker(key, listAvailRaftServer())
-	case "join":
-		peer := flag.Args()[1]
-		sendJoin(peer, listAvailRaftServer())
-	case "leave":
-		peer := flag.Args()[1]
-		sendLeave(peer, listAvailRaftServer())
 	case "sm":
 		command := flag.Args()[1]
 		switch command {
@@ -429,6 +400,14 @@ func main() {
 			parseInt, _ := strconv.Atoi(flag.Args()[3])
 			configId := int64(parseInt)
 			smGetReconfig(peer, configId)
+		}
+	case "sg":
+		command := flag.Args()[1]
+		switch command {
+		case "dummytest":
+			endpoint := flag.Args()[2]
+			sg_dummytest(endpoint)
+		case "test":
 		}
 
 	default:

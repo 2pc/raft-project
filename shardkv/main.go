@@ -18,7 +18,7 @@ import (
 
 const (
 	NUM_PEER_IN_GROUP    = 5
-	NUM_GROUP_IN_CLUSTER = 1
+	NUM_GROUP_IN_CLUSTER = 3
 )
 
 func peer_name_split(peer string) (int, int) {
