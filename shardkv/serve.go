@@ -21,7 +21,7 @@ const (
 	LOG_LIMIT                    = 30
 	ELECTION_TIMEOUT_UPPER_BOUND = 20000
 	ELECTION_TIMEOUT_LOWER_BOUND = 5000
-	HEARTBEAT_TIMEOUT            = 1000
+	HEARTBEAT_TIMEOUT            = 2000
 	RECONFIG_TIMEOUT             = 3000
 	SERVICE_TIMEOUT              = 3000
 )
@@ -315,7 +315,10 @@ func broadcastHeartbeat(raft *Raft, peerClients *map[string]pb.RaftClient,
 }
 
 func connectToShardMaster(peer string) (pb.ShardMasterClient, error) {
-	conn, err := grpc.Dial(peer, grpc.WithInsecure(), grpc.WithTimeout(SERVICE_TIMEOUT*time.Millisecond))
+	backoffConfig := grpc.DefaultBackoffConfig
+	// Choose an aggressive backoff strategy here.
+	backoffConfig.MaxDelay = 1000 * time.Millisecond
+	conn, err := grpc.Dial(peer, grpc.WithInsecure(), grpc.WithBackoffConfig(backoffConfig))
 	// Ensure connection did not fail, which should not happen since this happens in the background
 	if err != nil {
 		return pb.NewShardMasterClient(nil), err
@@ -332,7 +335,9 @@ func queryReconfig(s *ShardKv, raft *Raft, smPeers []string, getReconfigResponse
 			if err != nil {
 				return
 			}
-			ret, err := c.GetReconfig(context.Background(), args)
+			ctx, cancel := context.WithTimeout(context.Background(), SERVICE_TIMEOUT*time.Millisecond)
+			defer cancel()
+			ret, err := c.GetReconfig(ctx, args)
 			if err != nil {
 				return
 			}
@@ -349,7 +354,10 @@ func queryReconfig(s *ShardKv, raft *Raft, smPeers []string, getReconfigResponse
 }
 
 func connectToShardKv(peer string) (pb.ShardKvClient, error) {
-	conn, err := grpc.Dial(peer, grpc.WithInsecure(), grpc.WithTimeout(SERVICE_TIMEOUT*time.Millisecond))
+	backoffConfig := grpc.DefaultBackoffConfig
+	// Choose an aggressive backoff strategy here.
+	backoffConfig.MaxDelay = 1000 * time.Millisecond
+	conn, err := grpc.Dial(peer, grpc.WithInsecure(), grpc.WithBackoffConfig(backoffConfig))
 	// Ensure connection did not fail, which should not happen since this happens in the background
 	if err != nil {
 		return pb.NewShardKvClient(nil), err
@@ -363,10 +371,13 @@ func migrateKey(reconfig *pb.Reconfig, raft *Raft, shardKvPeers []string, migrat
 		args := reconfig
 		go func(p string, args *pb.Reconfig) {
 			c, err := connectToShardKv(p)
+			log.Printf("Trying to get key from %v", p)
 			if err != nil {
 				return
 			}
-			ret, err := c.KeyMigration(context.Background(), args)
+			ctx, cancel := context.WithTimeout(context.Background(), SERVICE_TIMEOUT*time.Millisecond)
+			defer cancel()
+			ret, err := c.KeyMigration(ctx, args)
 			if err != nil {
 				return
 			}
@@ -1058,6 +1069,7 @@ func serve(s *ShardKv, r *rand.Rand, peers *[]string, services map[int64]([]stri
 				break
 			}
 			if srcGid == raft.groupId {
+				log.Printf("I'm the sender of configuration %v", configId)
 				// I'm the sender, I should not serve this key anymore
 				cmd := pb.Command{
 					Operation: pb.Op_DISABLEKEY,
@@ -1074,6 +1086,7 @@ func serve(s *ShardKv, r *rand.Rand, peers *[]string, services map[int64]([]stri
 				raft.lastLogIndex++
 				raft.lastLogTerm = raft.currentTerm
 			} else if dstGid == raft.groupId {
+				log.Printf("I'm the receiver of configuration %v", configId)
 				// I'm the reciver, I should get the key I need...
 				if srcGid == 0 {
 					// this key came from invalid, we simply need to enable it
@@ -1096,6 +1109,7 @@ func serve(s *ShardKv, r *rand.Rand, peers *[]string, services map[int64]([]stri
 					migrateKey(reconfig, &raft, services[srcGid], &migrateKeyResponseChan)
 				}
 			} else {
+				log.Printf("I dont' care about configuration %v", configId)
 				// Not my bussiness, but I need to update our config num
 				cmd := pb.Command{
 					Operation: pb.Op_UPDATECONFIG,

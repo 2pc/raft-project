@@ -10,7 +10,7 @@ import yaml
 
 def peer_name_to_group_peer(peer_name):
     tmp = peer_name.split('-')
-    return tmp[1], tmp[2]
+    return tmp[0][4:], tmp[1].split(':')[0]
 
 def find_pods(v1):
     """Find pods started by us or at least running shardkv-peer/shardmaster-peer"""

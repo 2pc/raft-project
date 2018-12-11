@@ -82,7 +82,7 @@ func main() {
 
 	// construct the peers in shardmaster/other groups
 	services := make(map[int64]([]string))
-	for i := 0; i < NUM_GROUP_IN_CLUSTER; i++ {
+	for i := 0; i <= NUM_GROUP_IN_CLUSTER; i++ {
 		if i != group_id {
 			services[int64(i)] = make([]string, 0)
 			for j := 0; j < NUM_PEER_IN_GROUP; j++ {

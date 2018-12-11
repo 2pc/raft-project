@@ -21,7 +21,7 @@ const (
 	LOG_LIMIT                    = 30
 	ELECTION_TIMEOUT_UPPER_BOUND = 20000
 	ELECTION_TIMEOUT_LOWER_BOUND = 5000
-	HEARTBEAT_TIMEOUT            = 1000
+	HEARTBEAT_TIMEOUT            = 2000
 )
 
 // Messages that can be passed from the Raft RPC server to the main loop for AppendEntries

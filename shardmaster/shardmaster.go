@@ -74,7 +74,7 @@ func (s *ShardMaster) ReconfigInternal(k string, destGid int64) pb.Result {
 		return pb.Result{Result: &pb.Result_S{S: &pb.Success{}}}
 	} else {
 		// create a new reconfig entry
-		configId := int64(len(s.KeyConfig))
+		configId := int64(len(s.Reconfigs))
 		srcGid := s.KeyConfig[k]
 
 		reconfigItem := &pb.Reconfig{

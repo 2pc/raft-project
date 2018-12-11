@@ -6,7 +6,6 @@ import (
 	"log"
 	"os"
 	"os/exec"
-	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -27,6 +26,13 @@ func usage() {
 	flag.PrintDefaults()
 }
 
+func peer_name_split(peer string) (int64, int64) {
+	tmp := strings.Split(peer, "-")
+	group_id, _ := strconv.Atoi(tmp[0][4:])
+	peer_id, _ := strconv.Atoi(tmp[1])
+	return int64(group_id), int64(peer_id)
+}
+
 func getKVServiceURL(peer string) (string, error) {
 	cmd := exec.Command("../launch-tool/launch.py", "client-url", peer)
 	stdout, err := cmd.Output()
@@ -37,80 +43,122 @@ func getKVServiceURL(peer string) (string, error) {
 	return endpoint, nil
 }
 
-func listAvailRaftServer() []string {
-	cmd := exec.Command("../launch-tool/launch.py", "list")
-	stdout, err := cmd.Output()
-	if err != nil {
-		log.Fatalf("Cannot list Raft servers.")
-	}
-	re := regexp.MustCompile("peer[0-9]+")
-	peers := re.FindAllString(string(stdout), -1)
-	return peers
-}
-
 func connToEndpoint(endpoint string) (*grpc.ClientConn, error) {
-	conn, err := grpc.Dial(endpoint, grpc.WithInsecure(), grpc.WithTimeout(5000*time.Millisecond))
+	conn, err := grpc.Dial(endpoint, grpc.WithInsecure(), grpc.WithTimeout(3000*time.Millisecond))
 	return conn, err
 }
 
-func getServerAtNextIndex(allServer []string, serverIndex *int) string {
-	endpoint, err := getKVServiceURL(allServer[*serverIndex])
+func getServerAtNextIndex(groupId int64, serverIndex *int) string {
+	peerName := fmt.Sprintf("peer%d-%d", groupId, *serverIndex)
+	endpoint, err := getKVServiceURL(peerName)
 	*serverIndex += 1
-	if *serverIndex >= len(allServer) {
+	if *serverIndex >= NUM_PEER_IN_GROUP {
 		*serverIndex = 0
 	}
 	if err != nil {
-		return getServerAtNextIndex(allServer, serverIndex)
+		return getServerAtNextIndex(groupId, serverIndex)
 	}
 	return endpoint
 }
 
-func getKvcAtNextIndex(allServer []string, serverIndex *int) pb.KvStoreClient {
-	endpoint := getServerAtNextIndex(allServer, serverIndex)
+func getShardKvAtNextIndex(groupId int64, serverIndex *int) pb.ShardKvClient {
+	endpoint := getServerAtNextIndex(groupId, serverIndex)
 	conn, err := connToEndpoint(endpoint)
 	if err != nil {
 		*serverIndex += 1
-		if *serverIndex >= len(allServer) {
+		if *serverIndex >= NUM_PEER_IN_GROUP {
 			*serverIndex = 0
 		}
-		return getKvcAtNextIndex(allServer, serverIndex)
+		return getShardKvAtNextIndex(groupId, serverIndex)
 	}
 	// Create a KvStore client
-	kvc := pb.NewKvStoreClient(conn)
+	kvc := pb.NewShardKvClient(conn)
 	return kvc
 }
 
-func getKvcAtRedirect(peer string, allServer []string, serverIndex *int) pb.KvStoreClient {
+func getShardMasterAtNextIndex(serverIndex *int) pb.ShardMasterClient {
+	endpoint := getServerAtNextIndex(0, serverIndex)
+	conn, err := connToEndpoint(endpoint)
+	if err != nil {
+		*serverIndex += 1
+		if *serverIndex >= NUM_PEER_IN_GROUP {
+			*serverIndex = 0
+		}
+		return getShardMasterAtNextIndex(serverIndex)
+	}
+	smc := pb.NewShardMasterClient(conn)
+	return smc
+}
+
+func getShardKvAtRedirect(peer string, serverIndex *int) pb.ShardKvClient {
+	groupId, _ := peer_name_split(peer)
 	endpoint, err := getKVServiceURL(peer)
 	if err != nil {
-		return getKvcAtNextIndex(allServer, serverIndex)
+		return getShardKvAtNextIndex(groupId, serverIndex)
 	}
 	conn, err := connToEndpoint(endpoint)
 	if err != nil {
-		return getKvcAtNextIndex(allServer, serverIndex)
+		return getShardKvAtNextIndex(groupId, serverIndex)
 	}
 	// Create a KvStore client
-	kvc := pb.NewKvStoreClient(conn)
+	kvc := pb.NewShardKvClient(conn)
 	return kvc
 }
 
-func sg_single_checker(key string, allServer []string) {
+func getShardMasterAtRedirect(peer string, serverIndex *int) pb.ShardMasterClient {
+	endpoint, err := getKVServiceURL(peer)
+	if err != nil {
+		return getShardMasterAtNextIndex(serverIndex)
+	}
+	conn, err := connToEndpoint(endpoint)
+	if err != nil {
+		return getShardMasterAtNextIndex(serverIndex)
+	}
+	// Create a KvStore client
+	smc := pb.NewShardMasterClient(conn)
+	return smc
+}
+
+func sg_single_checker(key string) {
 	serverIndex := 0
-	kvc := getKvcAtNextIndex(allServer, &serverIndex)
 	flag := false
+
+	// fisrt, get group id
+	keyGid := int64(0)
+	for keyGid == 0 {
+		time.Sleep(200 * time.Millisecond)
+		keyGid = smGetConfig(key)
+	}
+	kvc := getShardKvAtNextIndex(keyGid, &serverIndex)
 	for {
 		flag = true
 		for flag {
 			// Put setting key -> 1
 			putReq := &pb.KeyValue{Key: key, Value: "1"}
-			res, err := kvc.Set(context.Background(), putReq)
+			ctx, cancel := context.WithTimeout(context.Background(), 3000*time.Millisecond)
+			res, err := kvc.Set(ctx, putReq)
 			if err != nil {
-				kvc = getKvcAtNextIndex(allServer, &serverIndex)
+				kvc = getShardKvAtNextIndex(keyGid, &serverIndex)
 				continue
 			}
+			cancel()
 			if redirect := res.GetRedirect(); redirect != nil {
 				log.Printf("Got redirect response: %v", redirect.Server)
-				kvc = getKvcAtRedirect(redirect.Server, allServer, &serverIndex)
+				if redirect.Server != "" {
+					kvc = getShardKvAtRedirect(redirect.Server, &serverIndex)
+				} else {
+					kvc = getShardKvAtNextIndex(keyGid, &serverIndex)
+				}
+				continue
+			}
+			if notResponsible := res.GetNotResponsible(); notResponsible != nil {
+				log.Printf("Got not responsible response, query ShardMaster for new key assignment")
+				keyGid = smGetConfig(key)
+				for keyGid == 0 {
+					time.Sleep(200 * time.Millisecond)
+					keyGid = smGetConfig(key)
+				}
+				kvc = getShardKvAtNextIndex(keyGid, &serverIndex)
 				continue
 			}
 			log.Printf("Got response key: \"%v\" value:\"%v\"", res.GetKv().Key, res.GetKv().Value)
@@ -119,19 +167,34 @@ func sg_single_checker(key string, allServer []string) {
 			}
 			flag = false
 		}
-
 		flag = true
 		for flag {
 			// Request value for key
 			req := &pb.Key{Key: key}
-			res, err := kvc.Get(context.Background(), req)
+			ctx, cancel := context.WithTimeout(context.Background(), 3000*time.Millisecond)
+			res, err := kvc.Get(ctx, req)
 			if err != nil {
-				kvc = getKvcAtNextIndex(allServer, &serverIndex)
+				kvc = getShardKvAtNextIndex(keyGid, &serverIndex)
 				continue
 			}
+			cancel()
 			if redirect := res.GetRedirect(); redirect != nil {
 				log.Printf("Got redirect response: %v", redirect.Server)
-				kvc = getKvcAtRedirect(redirect.Server, allServer, &serverIndex)
+				if redirect.Server != "" {
+					kvc = getShardKvAtRedirect(redirect.Server, &serverIndex)
+				} else {
+					kvc = getShardKvAtNextIndex(keyGid, &serverIndex)
+				}
+				continue
+			}
+			if notResponsible := res.GetNotResponsible(); notResponsible != nil {
+				log.Printf("Got not responsible response, query ShardMaster for new key assignment")
+				keyGid = smGetConfig(key)
+				for keyGid == 0 {
+					time.Sleep(200 * time.Millisecond)
+					keyGid = smGetConfig(key)
+				}
+				kvc = getShardKvAtNextIndex(keyGid, &serverIndex)
 				continue
 			}
 			log.Printf("Got response key: \"%v\" value:\"%v\"", res.GetKv().Key, res.GetKv().Value)
@@ -145,14 +208,30 @@ func sg_single_checker(key string, allServer []string) {
 		for flag {
 			// Successfully CAS changing key -> 2
 			casReq := &pb.CASArg{Kv: &pb.KeyValue{Key: key, Value: "1"}, Value: &pb.Value{Value: "2"}}
-			res, err := kvc.CAS(context.Background(), casReq)
+			ctx, cancel := context.WithTimeout(context.Background(), 3000*time.Millisecond)
+			res, err := kvc.CAS(ctx, casReq)
 			if err != nil {
-				kvc = getKvcAtNextIndex(allServer, &serverIndex)
+				kvc = getShardKvAtNextIndex(keyGid, &serverIndex)
 				continue
 			}
+			cancel()
 			if redirect := res.GetRedirect(); redirect != nil {
 				log.Printf("Got redirect response: %v", redirect.Server)
-				kvc = getKvcAtRedirect(redirect.Server, allServer, &serverIndex)
+				if redirect.Server != "" {
+					kvc = getShardKvAtRedirect(redirect.Server, &serverIndex)
+				} else {
+					kvc = getShardKvAtNextIndex(keyGid, &serverIndex)
+				}
+				continue
+			}
+			if notResponsible := res.GetNotResponsible(); notResponsible != nil {
+				log.Printf("Got not responsible response, query ShardMaster for new key assignment")
+				keyGid = smGetConfig(key)
+				for keyGid == 0 {
+					time.Sleep(200 * time.Millisecond)
+					keyGid = smGetConfig(key)
+				}
+				kvc = getShardKvAtNextIndex(keyGid, &serverIndex)
 				continue
 			}
 			log.Printf("Got response key: \"%v\" value:\"%v\"", res.GetKv().Key, res.GetKv().Value)
@@ -166,14 +245,30 @@ func sg_single_checker(key string, allServer []string) {
 		for flag {
 			// Unsuccessfully CAS
 			casReq := &pb.CASArg{Kv: &pb.KeyValue{Key: key, Value: "1"}, Value: &pb.Value{Value: "3"}}
-			res, err := kvc.CAS(context.Background(), casReq)
+			ctx, cancel := context.WithTimeout(context.Background(), 3000*time.Millisecond)
+			res, err := kvc.CAS(ctx, casReq)
 			if err != nil {
-				kvc = getKvcAtNextIndex(allServer, &serverIndex)
+				kvc = getShardKvAtNextIndex(keyGid, &serverIndex)
 				continue
 			}
+			cancel()
 			if redirect := res.GetRedirect(); redirect != nil {
 				log.Printf("Got redirect response: %v", redirect.Server)
-				kvc = getKvcAtRedirect(redirect.Server, allServer, &serverIndex)
+				if redirect.Server != "" {
+					kvc = getShardKvAtRedirect(redirect.Server, &serverIndex)
+				} else {
+					kvc = getShardKvAtNextIndex(keyGid, &serverIndex)
+				}
+				continue
+			}
+			if notResponsible := res.GetNotResponsible(); notResponsible != nil {
+				log.Printf("Got not responsible response, query ShardMaster for new key assignment")
+				keyGid = smGetConfig(key)
+				for keyGid == 0 {
+					time.Sleep(200 * time.Millisecond)
+					keyGid = smGetConfig(key)
+				}
+				kvc = getShardKvAtNextIndex(keyGid, &serverIndex)
 				continue
 			}
 			log.Printf("Got response key: \"%v\" value:\"%v\"", res.GetKv().Key, res.GetKv().Value)
@@ -187,19 +282,23 @@ func sg_single_checker(key string, allServer []string) {
 
 func sg_dummytest(peer string) {
 	log.Printf("Connecting to %v", peer)
+
 	// Connect to the server. We use WithInsecure since we do not configure https in this class.
 	endpoint, err := getKVServiceURL(peer)
 	if err != nil {
 		log.Fatalf("Failed to dial GRPC server %v", err)
 	}
 	conn, err := connToEndpoint(endpoint)
+
 	//Ensure connection did not fail.
 	if err != nil {
 		log.Fatalf("Failed to dial GRPC server %v", err)
 	}
 	log.Printf("Connected")
+
 	// Create a KvStore client
 	kvc := pb.NewShardKvClient(conn)
+
 	// Clear KVC
 	res, err := kvc.Clear(context.Background(), &pb.Empty{})
 	if err != nil {
@@ -286,89 +385,67 @@ func sg_dummytest(peer string) {
 	}
 }
 
-func smGetConfig(peer string, key string) {
-	log.Printf("Connecting to %v", peer)
-	// Connect to the server. We use WithInsecure since we do not configure https in this class.
-	endpoint, err := getKVServiceURL(peer)
-	if err != nil {
-		log.Fatalf("Failed to dial GRPC server %v", err)
+func smGetConfig(key string) int64 {
+	serverIndex := 0
+	smc := getShardMasterAtNextIndex(&serverIndex)
+	for true {
+		res, err := smc.GetKeyGroup(context.Background(), &pb.Key{Key: key})
+		if err != nil {
+			log.Printf("%v", err)
+			smc = getShardMasterAtNextIndex(&serverIndex)
+		}
+		if redirect := res.GetRedirect(); redirect != nil {
+			log.Printf("Got redirect response: %v", redirect.Server)
+			smc = getShardMasterAtRedirect(redirect.Server, &serverIndex)
+			continue
+		}
+		log.Printf("Got response GroupId:%v", res.GetGid().Gid)
+		return res.GetGid().Gid
 	}
-	conn, err := connToEndpoint(endpoint)
-	//Ensure connection did not fail.
-	if err != nil {
-		log.Fatalf("Failed to dial GRPC server %v", err)
-	}
-	log.Printf("Connected")
-
-	smc := pb.NewShardMasterClient(conn)
-
-	res, err := smc.GetKeyGroup(context.Background(), &pb.Key{Key: key})
-	if err != nil {
-		log.Printf("%v", err)
-		log.Fatalf("Could not get")
-	}
-	if redirect := res.GetRedirect(); redirect != nil {
-		log.Printf("Got redirect response: %v", redirect.Server)
-		return
-	}
-	log.Printf("Got response value:%v", res.GetGid().Gid)
+	return 0
 }
 
-func smSetConfig(peer string, key string, dstGid int64) {
-	log.Printf("Connecting to %v", peer)
-	// Connect to the server. We use WithInsecure since we do not configure https in this class.
-	endpoint, err := getKVServiceURL(peer)
-	if err != nil {
-		log.Fatalf("Failed to dial GRPC server %v", err)
-	}
-	conn, err := connToEndpoint(endpoint)
-	//Ensure connection did not fail.
-	if err != nil {
-		log.Fatalf("Failed to dial GRPC server %v", err)
-	}
-	log.Printf("Connected")
-
-	smc := pb.NewShardMasterClient(conn)
-
-	smSetReq := &pb.ReconfigArgs{Key: &pb.Key{Key: key}, DestGid: &pb.GroupId{Gid: dstGid}}
-	res, err := smc.Reconfig(context.Background(), smSetReq)
-	if err != nil {
-		log.Fatalf("Could not get")
-	}
-	if redirect := res.GetRedirect(); redirect != nil {
-		log.Printf("Got redirect response: %v", redirect.Server)
+func smSetConfig(key string, dstGid int64) {
+	serverIndex := 0
+	smc := getShardMasterAtNextIndex(&serverIndex)
+	for true {
+		smSetReq := &pb.ReconfigArgs{Key: &pb.Key{Key: key}, DestGid: &pb.GroupId{Gid: dstGid}}
+		res, err := smc.Reconfig(context.Background(), smSetReq)
+		if err != nil {
+			log.Printf("%v", err)
+			smc = getShardMasterAtNextIndex(&serverIndex)
+		}
+		if redirect := res.GetRedirect(); redirect != nil {
+			log.Printf("Got redirect response: %v", redirect.Server)
+			smc = getShardMasterAtRedirect(redirect.Server, &serverIndex)
+			continue
+		}
+		log.Printf("Set complete")
 		return
 	}
-	log.Printf("Set complete")
 }
 
-func smGetReconfig(peer string, configId int64) {
-	log.Printf("Connecting to %v", peer)
-	endpoint, err := getKVServiceURL(peer)
-	if err != nil {
-		log.Fatalf("Failed to dial GRPC server %v", err)
-	}
-	conn, err := connToEndpoint(endpoint)
-	//Ensure connection did not fail.
-	if err != nil {
-		log.Fatalf("Failed to dial GRPC server %v", err)
-	}
-	log.Printf("Connected")
-
-	smc := pb.NewShardMasterClient(conn)
-
-	smGetReconfigReq := &pb.ConfigId{ConfigId: configId}
-	res, err := smc.GetReconfig(context.Background(), smGetReconfigReq)
-	if err != nil {
-		log.Fatalf("Could not get")
-	}
-	if redirect := res.GetRedirect(); redirect != nil {
-		log.Printf("Got redirect response: %v", redirect.Server)
+func smGetReconfig(configId int64) {
+	serverIndex := 0
+	flag := true
+	smc := getShardMasterAtNextIndex(&serverIndex)
+	for flag {
+		smGetReconfigReq := &pb.ConfigId{ConfigId: configId}
+		res, err := smc.GetReconfig(context.Background(), smGetReconfigReq)
+		if err != nil {
+			log.Printf("%v", err)
+			smc = getShardMasterAtNextIndex(&serverIndex)
+		}
+		if redirect := res.GetRedirect(); redirect != nil {
+			log.Printf("Got redirect response: %v", redirect.Server)
+			smc = getShardMasterAtRedirect(redirect.Server, &serverIndex)
+			continue
+		}
+		reconfig := res.GetReconfig()
+		log.Printf("Got response configId:%v, src group:%v, dst group:%v, key: %v",
+			reconfig.ConfigId.ConfigId, reconfig.Src.Gid, reconfig.Dst.Gid, reconfig.Key.Key)
 		return
 	}
-	reconfig := res.GetReconfig()
-	log.Printf("Got response configId:%v, src group:%v, dst group:%v, key: %v",
-		reconfig.ConfigId.ConfigId, reconfig.Src.Gid, reconfig.Dst.Gid, reconfig.Key.Key)
 }
 
 func main() {
@@ -386,20 +463,17 @@ func main() {
 		command := flag.Args()[1]
 		switch command {
 		case "getconfig":
-			peer := flag.Args()[2]
-			key := flag.Args()[3]
-			smGetConfig(peer, key)
+			key := flag.Args()[2]
+			smGetConfig(key)
 		case "setconfig":
-			peer := flag.Args()[2]
-			key := flag.Args()[3]
-			parseInt, _ := strconv.Atoi(flag.Args()[4])
-			dstGroup := int64(parseInt)
-			smSetConfig(peer, key, dstGroup)
-		case "getreconfig":
-			peer := flag.Args()[2]
+			key := flag.Args()[2]
 			parseInt, _ := strconv.Atoi(flag.Args()[3])
+			dstGroup := int64(parseInt)
+			smSetConfig(key, dstGroup)
+		case "getreconfig":
+			parseInt, _ := strconv.Atoi(flag.Args()[2])
 			configId := int64(parseInt)
-			smGetReconfig(peer, configId)
+			smGetReconfig(configId)
 		}
 	case "sg":
 		command := flag.Args()[1]
@@ -408,6 +482,8 @@ func main() {
 			endpoint := flag.Args()[2]
 			sg_dummytest(endpoint)
 		case "test":
+			key := flag.Args()[2]
+			sg_single_checker(key)
 		}
 
 	default:
