@@ -4,6 +4,9 @@
 *.dll
 *.so
 *.dylib
+./client/client
+./shardmaster/shardmaster
+./shardkv/shardkv
 
 # Test binary, build with `go test -c`
 *.test
