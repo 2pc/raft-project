@@ -9,7 +9,7 @@ Dayou Du (dayoudu@nyu.edu)
 
 This repo is the final project in Distributed System Class :D. Basically we added snapshot, sharding, and cluster membership change(peers join/leave) support on our Raft implementation. For the details plase checkout the report.
 
-**For the sharded kv extension, please checkout shardkv branch, which greatly restructed the codes and also re-wrote the helper scripts(though use roughly the same raft implementation).**
+**This shardkv branch is used to implement the sharding extension, which greatly restructed the codes and also re-wrote the helper scripts(though use roughly the same raft implementation).**
 
 ## Prerequisities
 
@@ -24,37 +24,29 @@ To use the provided launch tool, you will also need:
 
 ## Get Started
 
-The codes are in `server` directory, while the `client` folder contains some helper testing code. To work with kubernetes, a helper script can be found in `launch-tool/launch.py`, which is initially created by Prof. Aurojit Panda.
+Since we would end up with multiple raft clusters, we assume a fixed naming mechanism (peerX-Y) to mark the peer-group matching. X is the groupID of the peer, and group 0 means this peer belongs to shard master group. Y is the peerID inside each group. e.g: peer0-0 is a shardmaster service peer, while peer2-1 is a shardkv service peer. Thus, 0 is an invalid group assignment of a shard.
+
+The codes are in `shardmaster` and `shardkv` folder respectively. While the `client` folder contains some helper testing code. To work with kubernetes, a helper script can be found in `launch-tool/launch.py`, which is rewritten based on Prof. Aurojit Panda's original script.
 
 ### Build/Run Natively
 
-1. `cd server`
-2. `go build .`
-3. `./server <-peer peer-args>`
-
-To test with the provided client codes:
-
-1. `cd client`
-2. `go build .`
-3. `./client <dummytest/test/multitest/join/leave> <command args>`
+No longer supported
 
 ### Build/Run with Kubernetes
 
-For testing you can also use Kubernetes, we have provided a script in `launch-tool/launch.py`. Please not that `launch.py` 
-hardcodes a bunch of assumptions about how pods are created, about the fact that we are running under minikube, and that 
-the image itself is named `local/raft-peer`. As such one can adopt this script for other purposes, but this will need some work.
+We provide a simple script for you to build the whole project. You can just type `built.sh <num groups> <num peers>`. Note that for now these two arguments need to match the settings in the code files. 
 
-To use Kubernetes with this project use `./create-docker-image.sh` to first create a Docker image. Then:
+For testing you can still use `launch-tool/launch.py`. **Note that the script has been major rewritten to be used in our case, thus the commands/arguments are different with the original one**:
 
--   `./launch.py boot <num peers>` will boot a cluster with `num peers` participants. Each participant is given a list of
-  all other participants (so you can connect to them).
+-   `./launch.py boot <num groups> <num peers>` will boot a cluster with `num groups` of shardkv groups (note that we also have a shardmaster group, thus this will result in totally `num gouprs + 1` of raft clusters), while each group has `num peers` participants.
 -   `./launch.py list` lists all peers in the current cluster. You can use `kubectl logs <name>` to access the log for a
     particular pod.
--   `./launch.py kill <n>` can be used to kill the nth pod.
--   `./launch.py launch <n>` can be used to relaunch the nth pod (e.g., after it is killed).
+-   `./launch.py kill <peer name>` can be used to kill a pod.
+-   `./launch.py launch <peer name>` can be used to relaunch a pod (e.g., after it is killed).
 -   `./launch.py shutdown` will kill all pods, shutting down the cluster.
--   `./launch.py client-url <n>` can be used to get the URL for the nth pod. One example use of this is `./client
-    $(../launch-tool/launch.py client-url 1)` to get a client to connect to pod 1.
+-   `./launch.py client-url <peer name>` can be used to get the URL for a pod.
+
+The client codes are also rewritten to be used to test the shardkv system. Generally you can build the client codes in the same way, and run it with `./client <sm/sg> <sm commands/sg commands> <sm command arguments/sg command arguments>`. Please check `client/main.go` for details.
 
 ## Acknowledgement
 
