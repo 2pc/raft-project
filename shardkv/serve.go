@@ -40,6 +40,9 @@ const (
 	HEARTBEAT_TIMEOUT            = 2000
 	RECONFIG_TIMEOUT             = 3000
 	SERVICE_TIMEOUT              = 3000
+	FOLLOWER = 0
+	CANDIDATE = 1
+	LEADER = 2
 )
 
 // Messages that can be passed from the Raft RPC server to the main loop for AppendEntries
@@ -418,7 +421,7 @@ func serve(s *ShardKv, r *rand.Rand, peers *[]string, services map[int64]([]stri
 		VoteChan:            make(chan VoteInput),
 		InstallSnapshotChan: make(chan InstallSnapshotInput),
 
-		state:      0,
+		state:      FOLLOWER,
 		voteCount:  0,
 		numPeers:   len(*peers) + 1, // for the symmetric purpose, including myself
 		majorCount: (len(*peers)+1)/2 + 1,
@@ -479,18 +482,18 @@ func serve(s *ShardKv, r *rand.Rand, peers *[]string, services map[int64]([]stri
 	for {
 		select {
 		case <-reconfigTimer.C:
-			if raft.state == 2 {
+			if raft.state == LEADER {
 				log.Printf("Leader now query the ShardMaster about new configurations")
 				queryReconfig(s, &raft, services[0], &getReconfigResponseChan)
 			}
 			restartReconfigTimer(reconfigTimer)
 		case <-electionTimer.C:
 			// The election timer went off.
-			if raft.state == 0 || raft.state == 1 {
+			if raft.state == FOLLOWER || raft.state == CANDIDATE {
 				log.Printf("Timeout, start a new round of election with term %v", raft.currentTerm+1)
 
 				// reset raft states
-				raft.state = 1
+				raft.state = CANDIDATE
 				raft.voteCount = 1 // yes we already voted for ourselves
 				raft.votedFor = id
 
@@ -518,14 +521,14 @@ func serve(s *ShardKv, r *rand.Rand, peers *[]string, services map[int64]([]stri
 			restartElectionTimer(electionTimer, r)
 
 		case <-heartbeatTimer.C:
-			if raft.state == 2 {
+			if raft.state == LEADER {
 				log.Printf("Leader trigger a new round of heatbeat messages with term %v", raft.currentTerm)
 				broadcastHeartbeat(&raft, &peerClients, &appendResponseChan, &installSnapshotResponseChan)
 			}
 			restartHeartbeatTimer(heartbeatTimer)
 
 		case op := <-s.C:
-			if raft.state == 0 {
+			if raft.state == FOLLOWER {
 				// as a follower, we should response with redirect message
 				server := raft.votedFor
 				if server == "" {
@@ -540,7 +543,7 @@ func serve(s *ShardKv, r *rand.Rand, peers *[]string, services map[int64]([]stri
 						},
 					},
 				}
-			} else if raft.state == 2 {
+			} else if raft.state == LEADER {
 				// as a leader, we should add this to our log
 				// and also save the response channel
 				newEntry := pb.Entry{
@@ -581,7 +584,7 @@ func serve(s *ShardKv, r *rand.Rand, peers *[]string, services map[int64]([]stri
 
 			if ae.arg.Term >= raft.currentTerm {
 				// Transit to follower
-				raft.state = 0
+				raft.state = FOLLOWER
 				raft.voteCount = 0
 				raft.currentTerm = ae.arg.Term
 				raft.votedFor = ae.arg.LeaderID
@@ -686,11 +689,11 @@ func serve(s *ShardKv, r *rand.Rand, peers *[]string, services map[int64]([]stri
 				log.Printf("Term %v greater than currect term %v, reset as a follower", vr.arg.Term, raft.currentTerm)
 				raft.currentTerm = vr.arg.Term
 				raft.votedFor = ""
-				raft.state = 0
+				raft.state = FOLLOWER
 				// restartTimer(timer, r, false)
 			}
 
-			if raft.state != 0 {
+			if raft.state != FOLLOWER {
 				log.Printf("Reject %v 's vote request - only followers can vote", vr.arg.CandidateID)
 				vr.response <- pb.RequestVoteRet{Term: raft.currentTerm, VoteGranted: false}
 				break
@@ -741,7 +744,7 @@ func serve(s *ShardKv, r *rand.Rand, peers *[]string, services map[int64]([]stri
 					raft.currentTerm = vr.ret.Term
 					raft.votedFor = ""
 					raft.voteCount = 0
-					raft.state = 0
+					raft.state = FOLLOWER
 					restartElectionTimer(electionTimer, r)
 				}
 
@@ -751,7 +754,7 @@ func serve(s *ShardKv, r *rand.Rand, peers *[]string, services map[int64]([]stri
 					break
 				}
 
-				if raft.state != 1 {
+				if raft.state != CANDIDATE {
 					log.Printf("Not a Candidate anymore, ignore it")
 					break
 				}
@@ -761,7 +764,7 @@ func serve(s *ShardKv, r *rand.Rand, peers *[]string, services map[int64]([]stri
 					if raft.voteCount >= raft.majorCount {
 						// become a leader!
 						log.Printf("Got enough votes, become a leader!")
-						raft.state = 2
+						raft.state = LEADER
 						raft.nextIndex = make(map[string]int64)
 						raft.matchIndex = make(map[string]int64)
 						raft.responseChans = make(map[int64]*chan pb.Result)
@@ -801,11 +804,11 @@ func serve(s *ShardKv, r *rand.Rand, peers *[]string, services map[int64]([]stri
 				raft.currentTerm = ar.ret.Term
 				raft.votedFor = ""
 				raft.voteCount = 0
-				raft.state = 0
+				raft.state = FOLLOWER
 				restartElectionTimer(electionTimer, r)
 			}
 
-			if raft.state != 2 {
+			if raft.state != LEADER {
 				log.Printf("Not a leader anymore, ignore it")
 				break
 			}
@@ -1001,7 +1004,7 @@ func serve(s *ShardKv, r *rand.Rand, peers *[]string, services map[int64]([]stri
 
 			if is.arg.Term >= raft.currentTerm {
 				// Transit to follower
-				raft.state = 0
+				raft.state = FOLLOWER
 				raft.voteCount = 0
 				raft.currentTerm = is.arg.Term
 				raft.votedFor = is.arg.LeaderID
@@ -1055,7 +1058,7 @@ func serve(s *ShardKv, r *rand.Rand, peers *[]string, services map[int64]([]stri
 				raft.currentTerm = sr.ret.Term
 				raft.votedFor = ""
 				raft.voteCount = 0
-				raft.state = 0
+				raft.state = FOLLOWER
 				restartElectionTimer(electionTimer, r)
 			}
 
@@ -1076,7 +1079,7 @@ func serve(s *ShardKv, r *rand.Rand, peers *[]string, services map[int64]([]stri
 			key := reconfig.Key.Key
 			log.Printf("Got response configId:%v, src group:%v, dst group:%v, key: %v",
 				configId, srcGid, dstGid, key)
-			if raft.state != 2 {
+			if raft.state != LEADER {
 				log.Printf("Not leader anymore, ignore")
 				break
 			}
@@ -1147,7 +1150,7 @@ func serve(s *ShardKv, r *rand.Rand, peers *[]string, services map[int64]([]stri
 			configId := reconfig.ConfigId.ConfigId
 			srcGid := reconfig.Src.Gid
 			key := reconfig.Key.Key
-			if raft.state != 2 {
+			if raft.state != LEADER {
 				log.Printf("Not leader anymore, ignore")
 				break
 			}
