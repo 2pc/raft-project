@@ -23,7 +23,8 @@ import (
 
 	context "golang.org/x/net/context"
 
-	"github.com/nyu-distributed-systems-fa18/raft-extension/pb"
+	pb "../pb"
+	//"github.com/nyu-distributed-systems-fa18/raft-extension/pb"
 )
 
 // The struct for data to send over channel
