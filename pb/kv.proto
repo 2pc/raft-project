@@ -2,6 +2,8 @@ syntax = "proto3";
 
 package pb;
 
+option go_package ="pb/pbraft";
+
 // Represents a single key, used for gets.
 message Key {
     string key = 1;
